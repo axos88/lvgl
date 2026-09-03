@@ -95,9 +95,14 @@ else()
     )
 endif()
 
-# The configurations whose tests are executed also run under the sanitizers and
-# collect coverage.
-if(LVGL_TEST_ENABLE AND IS_GNU_LIKE)
+# An aliasing violation only changes code generation with the optimizer on, and warnings do not
+# find it: -Wstrict-aliasing is silent even on accesses that miscompile. So the check is
+# behavioural, and the sanitizers have to go: their instrumentation inhibits the store
+# forwarding the bug shows up in.
+option(LVGL_TEST_STRICT_ALIASING
+       "Build optimized with -fstrict-aliasing instead of the sanitizers" OFF)
+
+if(LVGL_TEST_ENABLE AND IS_GNU_LIKE AND NOT LVGL_TEST_STRICT_ALIASING)
     set(SANITIZE_AND_COVERAGE_OPTIONS
         -fsanitize=address
         -fsanitize=leak
@@ -105,6 +110,12 @@ if(LVGL_TEST_ENABLE AND IS_GNU_LIKE)
         --coverage
     )
     list(APPEND COMPILE_OPTIONS ${SANITIZE_AND_COVERAGE_OPTIONS})
+endif()
+
+if(LVGL_TEST_STRICT_ALIASING AND IS_GNU_LIKE)
+    # -Wclobbered needs the optimizer to fire and is about something else. It currently trips on
+    # lv_libjpeg_turbo.c, which is worth fixing on its own rather than here.
+    list(APPEND COMPILE_OPTIONS -O2 -fstrict-aliasing -Wstrict-aliasing=3 -Wno-clobbered)
 endif()
 
 # Configuration dependent compiler options. Deriving these from the resulting
@@ -279,6 +290,15 @@ foreach(test_case_fname ${TEST_CASE_FILES})
     add_executable(${test_name} ${test_case_fname} ${test_runner_fname})
     target_include_directories(${test_name} PUBLIC ${TEST_INCLUDE_DIRS})
     target_compile_options(${test_name} PUBLIC ${LVGL_TESTFILE_COMPILE_OPTIONS})
+
+    # This one checks the word access macros against the aliasing rule, so it needs the same
+    # treatment as LVGL_TEST_STRICT_ALIASING even in the default configuration.
+    if(${test_name} STREQUAL "test_draw_sw_word_access" AND IS_GNU_LIKE)
+        target_compile_options(${test_name} PRIVATE
+            -O2 -fstrict-aliasing
+            -fno-sanitize=address -fno-sanitize=undefined
+            -fno-profile-arcs -fno-test-coverage)
+    endif()
     target_link_libraries(${test_name} PRIVATE
         test_common
         lvgl

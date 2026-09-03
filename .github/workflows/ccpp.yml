@@ -9,7 +9,7 @@ on:
 # https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency
 # Ensure that only one commit will be running tests at a time on each PR
 concurrency:
-  group: ${{ github.ref }}-${{ github.workflow }} 
+  group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
@@ -101,6 +101,25 @@ jobs:
       run: . /opt/esp/idf/export.sh && idf.py set-target esp32s3
     - name: Build
       run: . /opt/esp/idf/export.sh && idf.py build
+
+  test-strict-aliasing:
+    runs-on: ubuntu-24.04
+    # The other test jobs build as Debug, so -O0, where an aliasing violation cannot change the
+    # generated code. See LVGL_TEST_STRICT_ALIASING in tests/CMakeLists.txt.
+    name: Run tests with strict aliasing
+    steps:
+    - uses: actions/checkout@v7
+    - uses: ammaraskar/gcc-problem-matcher@master
+    - name: Setup Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - name: Install prerequisites
+      run: scripts/install-prerequisites.sh
+    - name: Install pngquant
+      run: scripts/install_pngquant.sh
+    - name: Run tests
+      run: python tests/main.py --build-option=OPTIONS_TEST_STRICT_ALIASING test --auto-clean
 
   test-native:
     runs-on: ubuntu-24.04

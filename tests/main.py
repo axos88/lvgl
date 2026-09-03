@@ -101,6 +101,13 @@ test_options = {
         "description": "NanoVG headless rendering with EGL and glTF, 32 bit color depth",
         "defconfigs": ["full", "depth_32", HOST, "sys_heap", "run_tests", "nanovg"],
     },
+    "OPTIONS_TEST_STRICT_ALIASING": {
+        "description": "Optimized build with type based alias analysis on, no sanitizers",
+        "defconfigs": ["full", "depth_32", HOST, "sys_heap", "run_tests"],
+        "cmake_args": ["-DLVGL_TEST_STRICT_ALIASING=ON"],
+        # Out of the default sweep: it collects no coverage, which the sweep analyses.
+        "on_demand": True,
+    },
 }
 
 
@@ -269,6 +276,7 @@ def build_tests(options_name, build_type, clean):
             % ";".join(get_defconfig_paths(options_name)),
             "-DLVGL_TEST_ENABLE=%s" % ("ON" if options_name in test_options else "OFF"),
         ]
+        cmake_args += get_build_config(options_name).get("cmake_args", [])
         cmake_args += target_cmake_args()
         # Use ccache as a compiler launcher when available. This dramatically
         # speeds up rebuilds across the build matrix and repeated invocations
@@ -498,6 +506,11 @@ if __name__ == "__main__":
                 options_to_build = build_only_options
         else:
             options_to_build = test_options
+        options_to_build = {
+            name: config
+            for name, config in options_to_build.items()
+            if not config.get("on_demand")
+        }
 
     clean_build_dirs = []
     for options_name in options_to_build:

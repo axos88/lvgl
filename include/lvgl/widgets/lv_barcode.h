@@ -156,16 +156,16 @@ void lv_barcode_set_update_mode(lv_obj_t * obj, lv_barcode_update_mode_t mode);
 lv_barcode_update_mode_t lv_barcode_get_update_mode(lv_obj_t * obj);
 
 /**
- * Get whether the last attempt to generate the bitmap failed. `lv_barcode_render()`, and
+ * Get whether the last attempt to generate the bitmap succeeded. `lv_barcode_render()`, and
  * `lv_barcode_update()` in IMMEDIATE mode, return their result directly; the rest cannot -
  * they run in a void setter, the resize handler, or a deferred fill in the draw pass. Use
  * this for those, e.g. after shrinking the object below the size its data needs.
  * @note A failure is not retried every redraw; only a change makes the Widget try again.
  * @param obj pointer to barcode object
- * @return true: the last generation attempt failed, or no data has been set yet;
- *         false: no generation attempt has failed; deferred changes may still be pending
+ * @return true: no generation attempt has failed; deferred changes may still be pending;
+ *         false: the last generation attempt failed, or no data has been set yet
  */
-bool lv_barcode_get_render_failed(lv_obj_t * obj);
+bool lv_barcode_get_render_valid(lv_obj_t * obj);
 
 /**
  * Get the dark color of a barcode object

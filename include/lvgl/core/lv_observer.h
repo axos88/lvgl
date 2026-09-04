@@ -263,12 +263,18 @@ struct _lv_subject_t {
     lv_ll_t deps;                        /**< Subjects this one read during its last evaluation */
     lv_ll_t dependents;                  /**< Subjects that read this one */
     uint16_t immediate_observer_cnt;     /**< Observers with LV_OBSERVER_MODE_IMMEDIATE */
+    uint32_t version;                    /**< Bumped on every actual value change. A dependent
+                                          * compares it against the version it last read to
+                                          * decide whether its mapper has to run at all. */
 
     uint32_t type                 :  4;  /**< Type of the *value*, i.e. what Observers see.
                                           * One of the LV_SUBJECT_TYPE_... values. */
     uint32_t input_type           :  4;  /**< Type accepted by the `lv_subject_set_...()`
                                           * functions. Equal to `type` unless the Subject was
                                           * made with `lv_subject_create_mapped()`. */
+    uint32_t input_pending        :  1;  /**< A write was recorded but its mapper has not run
+                                          * yet, so the pending work is not only a stale
+                                          * dependency and the mapper must not be skipped. */
     uint32_t copy_changed         :  1;  /**< Did the last copy into `buf` change the bytes?
                                           * Computed by the copying setters, which have the
                                           * old bytes to hand, and used for change detection. */

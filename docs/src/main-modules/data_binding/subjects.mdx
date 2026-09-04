@@ -97,9 +97,37 @@ Strings are copied into the Subject's own buffer, so update them with
 lv_subject_copy_string(title, "Settings");
 ```
 
-A Subject does not keep its previous value. An Observer that genuinely needs one — to
-animate away what was there before, say — remembers it itself, in a static or in its
-user data. Change detection does not need it: see [Mappers](#mappers).
+A Subject does not keep its previous value, and change detection does not need it: a
+mapper is handed the previous stored value in `*value`, which is the whole reason no
+history is stored. See [Mappers](#mappers).
+
+If something genuinely needs the previous value — to animate away what was there before,
+say — that is a **stateful mapper**, not a missing feature. The mapper already receives
+the previous value, and its `user_data` is where to publish it:
+
+```c
+typedef struct { int32_t previous; int32_t current; bool seeded; } transition_t;
+
+static bool transition_mapper(lv_subject_t * s, void * ud, lv_subject_value_t input, int32_t * value)
+{
+    LV_UNUSED(s);
+    transition_t * t = ud;
+    t->previous = t->seeded ? *value : input.num;   /* `*value` is the previous value */
+    t->current  = input.num;
+    t->seeded   = true;
+
+    if(input.num == *value) return false;
+    *value = input.num;
+    return true;
+}
+
+static transition_t tab;
+lv_subject_set_int_mapper(current_tab, transition_mapper, &tab);
+/* an Observer now reads tab.previous and tab.current */
+```
+
+The state lives in the mapper's user data, so one mapper serves several Subjects, each
+tracking its own transition — which a file-scope static could not do.
 
 ## Mappers
 

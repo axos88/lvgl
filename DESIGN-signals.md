@@ -75,12 +75,17 @@ A write first marks the transitive dependent closure dirty, then evaluates the
 effectively-eager subjects, whose mappers pull their dependencies. In a diamond
 (A→B, A→C, B+C→D) `D` evaluates exactly once and never sees a fresh `B` beside a stale `C`.
 
-### 1.4 Dirty subjects are a prefix of the global list
+### 1.4 Subjects needing a scan are a prefix of the global list
 
 `LV_GLOBAL_DEFAULT()->subject_ll` already held every `lv_subject_create()` subject.
-Invariant: everything with pending work sits in a prefix of it, so a walk starts at the
-head and stops at the first clean subject — O(pending), not O(all). `lv_ll_move_before()`
-relinks without reallocating, so subject pointers stay valid across a move.
+Invariant: every subject a drain or a flush must visit sits in a prefix of it, so a walk
+starts at the head and stops at the first subject that needs no scanning — O(pending),
+not O(all). `lv_ll_move_before()` relinks without reallocating, so subject pointers stay
+valid across a move.
+
+Note "needs a scan" rather than "is dirty": a subject that is dirty but has no observers
+and is not eager is due for nothing, and is deliberately kept out of the prefix. See
+§1.7.
 
 ### 1.5 Deleting
 
@@ -122,7 +127,30 @@ the call returns, because the input is retained and handed to the mapper again o
 re-evaluation. Retaining it is deliberate — it lets a mapper re-derive from its input —
 and it is why the lifetime rule is stated in terms of the next write.
 
-### 1.7 Removed
+### 1.7 Two things that keep the cost down
+
+**A no-change stops the propagation.** Every subject carries a `version`, bumped only
+when its value really changes, and every dependency edge remembers the version it read.
+Before re-running a dirty subject's mapper, its dependencies are brought up to date and
+their versions compared: if they all still match, the mapper is a function of unchanged
+inputs and is skipped. Because skipping leaves this subject's own version alone, its
+dependents skip too, transitively. A value that settles back to what it was therefore
+costs one evaluation, not one per level.
+
+The trap here, which the tests caught: a *deferred* write also arrives through the
+recompute path, and then the pending work is the input itself rather than a stale
+dependency. An `input_pending` flag distinguishes the two, and the mapper always runs
+when it is set.
+
+**Never-due subjects leave the scanned region.** A subject that is dirty but has no
+observers and is not eager is due for nothing: no drain evaluates it, no flush evaluates
+it, and it is computed when something reads it. Such subjects otherwise pile up at the
+front of the list and every drain walks past all of them, so the cost of a write grows
+with the number of derived subjects nobody reads. `needs_scanning()` keeps them in the
+tail region instead. Anything that can make one due again — gaining an immediate
+observer, or being declared eager — repositions it first.
+
+### 1.8 Removed
 
 - `LV_SUBJECT_TYPE_GROUP` and its three functions. An `LV_SUBJECT_TYPE_NONE` subject with
   a mapper expresses the same thing and more: the mapper decides *when* to notify, the
@@ -132,7 +160,7 @@ and it is why the lifetime rule is stated in terms of the next write.
   place) or `lv_subject_create_clamped()` (a separate bounded mirror).
 - `prev_value` and the five `lv_subject_get_previous_*()`.
 
-### 1.8 Forwarding a subject to a widget setter
+### 1.9 Forwarding a subject to a widget setter
 
 `lv_obj_bind_int()` and friends already forward to a setter shaped
 `void (lv_obj_t *, value)`. The gap was setters that take more: 129 style setters shaped
@@ -198,7 +226,7 @@ none.
 - `python3 tests/main.py test --build-options OPTIONS_TEST_DEFHEAP` — 183/183 pass.
 - `python3 tests/main.py build` — every configuration compiles, including
   `OPTIONS_MINIMAL` with `LV_USE_OBSERVER 0`, and the examples.
-- `test_observer.c` covers 147 cases.
+- `test_observer.c` covers 151 cases.
 
 `test_lodepng` is a known-flaky memory-ceiling assertion and is unrelated to this work.
 
@@ -386,37 +414,79 @@ language deliberately cannot say.
   but an XML expression should not be able to express one. Side effects belong in an
   observer the application writes.
 
-## 6. Low-hanging fruit
+## 6. Low-hanging fruit for LVGL XML
 
-Cheap next steps, roughly in value-per-effort order. Each is small and independent; none
-is required by anything above.
+The reason there is so much of it: **the runtime now does the hard part.** Dependency
+discovery, change detection, and scheduling are all handled by the C side, and a mapper's
+only interaction with the world is reading subject values. So XML has nothing to
+orchestrate — it only has to *declare*, and the codegen only has to *emit reads*.
 
-1. **Dependents introspection.** `lv_subject_get_dependency_count()`/`_get_dependency()`
-   expose the outgoing edges; there is no matching pair for `dependents`. The reverse
-   edges already exist in the struct, so this is two accessors, and it is what an editor
-   needs to draw the graph in the useful direction.
-2. **Prebuilt mappers for the common shapes.** A linear scale (`map(x, a, b, c, d)`), and
-   a printf-one-subject string mapper. Both are shapes users will otherwise write by hand
-   every time, and both are a dozen lines each on top of the existing helper pattern.
-3. **Switch sysmon to batched observers.** The performance and memory overlays currently
-   update through immediate observers, so they redraw on every write. One
-   `lv_observer_set_mode()` call each makes them once-per-frame. This is exactly what the
-   batched mode exists for, and it is a two-line change that exercises it in-tree.
-4. **`process_dirty()` is O(dirty²).** It restarts from the list head after each subject
-   it processes, because an eager mapper used to be able to re-dirty things. Mappers can
-   no longer write subjects, so that restart is now unnecessary: a generation counter, or
-   simply continuing the walk, makes it O(dirty). Small, and removes a comment that
-   apologises for itself.
-5. **An opt-in "remember the previous value" flag on an observer.** Removing
-   `lv_subject_get_previous_*()` was right for change detection, but
-   `lv_example_observer_4` shows a real use — animating away what was there before — that
-   now needs a hand-rolled static. One field and one flag on `lv_observer_t`, set by an
-   opt-in call, would serve that case without putting the cost on every subject.
-6. **The declarative XML subset**, without the expression language: `<clamp>`, `<min>`,
-   `<max>`, `<format>`, `<depends>`. Cheaper than §5.5 and covers most real subjects, so
-   it is worth having as its own step even if the expression language follows.
+Ordered by effort, cheapest first.
 
-Deliberately **not** on this list: writing subjects from an ISR or another thread. That
-needs atomic stores with release/acquire ordering, dirty propagation moved out of the
-write path, and the flush walking the whole list — a design, not a tweak. See the note in
-§1 about what a write currently touches.
+### 6.1 No codegen at all: XML that calls existing API
+
+These need a parser change and one generated call each. No new C, no expression
+evaluation, nothing to get subtly wrong.
+
+| XML | Generates |
+|---|---|
+| `<int name="v" mode="eager"/>` | `lv_subject_set_mode(v, LV_SUBJECT_MODE_EAGER)` |
+| `<int name="bounded"><clamped of="raw" min="0" max="100"/></int>` | `lv_subject_create_clamped(raw, …)` |
+| `<int name="peak"><max of="v"/></int>` | `lv_subject_create_max(v, NULL)` |
+| `<int name="lowest"><min of="v"/></int>` | `lv_subject_create_min(v, NULL)` |
+| `<lv_obj bind_style_bg_color="col" bind_style_part="main"/>` | `lv_obj_bind_style_color(obj, col, lv_obj_set_style_bg_color, LV_PART_MAIN)` |
+| `<lv_label bind_text="v" bind_mode="batched"/>` | the bind, plus `lv_observer_set_mode(…, BATCHED)` |
+
+The style-binding row is worth calling out: there are 129 style setters, all one shape,
+so a single attribute pattern covers the lot.
+
+### 6.2 One generated function, no expression parsing
+
+`<depends on="hour minute format"/>` on an `LV_SUBJECT_TYPE_NONE` subject generates a
+none-mapper that reads each named subject and returns `true`. Ten lines of codegen, and
+it replaces the whole Group Subject concept.
+
+`<format of="volume" fmt="%d%%"/>` on a string subject generates a string mapper that
+formats and compares. Slightly more, because it has to pick the right `lv_subject_get_*`
+per operand type, which the subject declarations already give it.
+
+### 6.3 The expression language (§5.5)
+
+The largest of the three and still not large, because it generates straight-line C over
+value reads. Worth doing after 6.1 and 6.2, since those cover most real subjects and
+prove the plumbing first.
+
+### 6.4 What the editor gets for free at each step
+
+- After 6.1: modes and derived-subject shapes are visible and editable, and the graph
+  has real edges for every `of=` and `bind_*` attribute.
+- After 6.2: aggregates and derived strings appear as nodes with known dependencies.
+- After 6.3: **generated mappers are pure by construction**, so the editor can promise
+  that a declared subject is safe as lazy. That is the one part of the contract a hand
+  written mapper can quietly break — the accumulating-mapper example exists because of
+  it — and an expression cannot express the violation.
+
+At every step, `lv_subject_get_dependency_count()` / `_get_dependency()` let the editor
+read the live graph back out of a running preview, so the diagram and the program cannot
+disagree.
+
+### 6.5 The gap worth closing first
+
+The graph is only readable in one direction. `deps` is exposed; `dependents` is not, even
+though the reverse edges are right there in the struct. Two accessors would let the
+editor answer "what breaks if I delete this subject?" — which is also exactly the
+question `lv_subject_delete()` now refuses on, so the runtime and the editor would be
+answering it from the same data.
+
+## 7. Not low-hanging
+
+- **Writing subjects from an ISR or another thread.** Needs atomic stores with
+  release/acquire ordering, dirty propagation moved out of the write path, and the flush
+  walking the whole list. A design, not a tweak; see §1 for what a write currently
+  touches.
+- **A "remember the previous value" flag.** Not needed at all, and proposing it was a
+  lapse: a mapper is handed the previous stored value in `*value`, and its `user_data` is
+  a place to keep it, so "I need to know what it was" is a **stateful mapper**, not
+  missing API. Better than a flag, in fact, because the state is per subject rather than
+  per file — `test_subject_stateful_mapper_is_per_subject` shows two subjects tracking
+  their own transitions through one mapper, which a file-scope static cannot do.

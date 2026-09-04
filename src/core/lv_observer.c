@@ -37,9 +37,12 @@ typedef struct {
     flag_cond_t cond : 3;
 } flag_and_cond_t;
 
-/* One edge of the dependency graph. */
+/* One edge of the dependency graph. `seen_version` is the dependency's version at the
+ * moment the mapper last read it, which is what lets a dependent skip its mapper when
+ * nothing it reads has actually changed. */
 typedef struct {
     lv_subject_t * subject;
+    uint32_t seen_version;
 } subject_ref_t;
 
 typedef struct {
@@ -114,6 +117,7 @@ static void deps_clear(lv_subject_t * subject);
 static void edges_teardown(lv_subject_t * subject);
 
 /* Dirty bookkeeping. Dirty Subjects are kept as a prefix of the global Subject list. */
+static bool needs_scanning(lv_subject_t * subject);
 static void list_reposition(lv_subject_t * subject);
 static void mark_dirty(lv_subject_t * subject);
 static void mark_pending_notify(lv_subject_t * subject);
@@ -156,6 +160,7 @@ static void subject_input_written(lv_subject_t * subject, const void * borrowed_
                                   void * superseded_input, bool superseded_input_owned);
 static void subject_commit_input(lv_subject_t * subject, const void * borrowed_input,
                                  void * superseded_input, bool superseded_input_owned);
+static bool deps_are_unchanged(lv_subject_t * subject);
 static void subject_recompute(lv_subject_t * subject);
 static void subject_pull(lv_subject_t * subject);
 static void notify(lv_subject_t * subject);
@@ -229,6 +234,8 @@ void lv_subject_track_dependency(lv_subject_t * subject)
     if(ref_list_contains(&reader->deps, subject)) return;
 
     if(!ref_list_add(&reader->deps, subject)) return;
+    /* The version the mapper is reading right now. */
+    ((subject_ref_t *)lv_ll_get_tail(&reader->deps))->seen_version = subject->version;
     if(!ref_list_add(&subject->dependents, reader)) {
         /* Keep both directions consistent if the reverse edge could not be stored. */
         ref_list_remove(&reader->deps, subject);
@@ -266,10 +273,11 @@ void lv_subject_set_mode(lv_subject_t * subject, lv_subject_mode_t mode)
     bool was_eager = subject_is_eager_now(subject);
     subject->mode = (mode == LV_SUBJECT_MODE_EAGER) ? 1U : 0U;
 
-    /* Becoming eager makes any pending work due immediately. */
-    if(!was_eager && subject_is_eager_now(subject) &&
-       (subject->dirty || subject->pending_notify)) {
-        process_dirty(false);
+    /* Becoming eager makes any pending work due immediately, and may have moved the
+     * Subject into the scanned region. */
+    if(!was_eager && subject_is_eager_now(subject)) {
+        list_reposition(subject);
+        if(subject->dirty || subject->pending_notify) process_dirty(false);
     }
     flush_timer_update();
 }
@@ -993,6 +1001,7 @@ void lv_observer_delete(lv_observer_t * observer)
     }
 
     lv_ll_remove(&(observer->subject->subs_ll), observer);
+    list_reposition(observer->subject);
 
     if(observer->auto_free_user_data) {
         lv_free(observer->user_data);
@@ -1598,6 +1607,7 @@ void lv_observer_set_mode(lv_observer_t * observer, lv_observer_mode_t mode)
     else {
         subject->immediate_observer_cnt++;
         /* The Subject is due now, so do not make this Observer wait for a flush. */
+        list_reposition(subject);
         if(subject->dirty || subject->pending_notify) process_dirty(false);
     }
 }
@@ -1709,11 +1719,27 @@ static void edges_teardown(lv_subject_t * subject)
 /* Keep the "dirty prefix" invariant after `dirty` or `pending_notify` changed.
  * An application-owned Subject is not in the list, so it cannot be relinked. It keeps
  * its flags and is brought up to date when something reads it. */
+/* Will a drain or a flush ever have to visit this Subject?
+ *
+ * A Subject that is dirty but has no Observers and is not eager is due for nothing: no
+ * drain evaluates it and no flush evaluates it. It is computed when something reads it,
+ * through `subject_pull()`, which needs no scan. Such Subjects otherwise accumulate at
+ * the front of the list and every drain walks past all of them, so the cost of a write
+ * grows with the number of derived Subjects nobody reads. Keeping them out of the
+ * scanned region is what stops that. */
+static bool needs_scanning(lv_subject_t * subject)
+{
+    if(subject->pending_notify) return true;         /* a flush owes a notification */
+    if(!subject->dirty) return false;
+    if(subject_is_eager_now(subject)) return true;   /* a drain must evaluate it */
+    return !lv_ll_is_empty(&subject->subs_ll);       /* a flush must evaluate it */
+}
+
 static void list_reposition(lv_subject_t * subject)
 {
     if(!subject->in_list) return;
 
-    if(subject->dirty || subject->pending_notify) {
+    if(needs_scanning(subject)) {
         lv_ll_move_before(&subject_list, subject, lv_ll_get_head(&subject_list));
     }
     else {
@@ -1775,7 +1801,7 @@ static void process_dirty(bool include_observed)
     while(progress) {
         progress = false;
         lv_subject_t * subject = lv_ll_get_head(&subject_list);
-        while(subject && (subject->dirty || subject->pending_notify)) {
+        while(subject && needs_scanning(subject)) {
             lv_subject_t * next = lv_ll_get_next(&subject_list, subject);
             bool due = subject_is_eager_now(subject) ||
                        (include_observed && !lv_ll_is_empty(&subject->subs_ll));
@@ -1815,7 +1841,7 @@ static void flush_timer_update(void)
 
     bool pending = false;
     lv_subject_t * head = lv_ll_get_head(&subject_list);
-    if(head && (head->dirty || head->pending_notify)) pending = true;
+    if(head && needs_scanning(head)) pending = true;
 
     if(!pending) {
         if(global->subject_flush_timer) lv_timer_pause(global->subject_flush_timer);
@@ -2097,6 +2123,7 @@ static void subject_input_written(lv_subject_t * subject, const void * borrowed_
     /* Lazy: record the input and go no further. A run of writes therefore costs one
      * evaluation instead of one per write, and a Subject nothing ever reads is never
      * evaluated at all. */
+    subject->input_pending = 1;
     mark_dirty(subject);
 
     /* The dependents have to be marked stale even though it is not yet known whether the
@@ -2120,6 +2147,7 @@ static void subject_commit_input(lv_subject_t * subject, const void * borrowed_i
     /* The mapper runs here, so the stored value is the mapped one and the raw input is
      * never observable through a getter. */
     bool changed = subject->has_mapper ? run_mapper(subject, borrowed_input) : apply_input(subject, borrowed_input);
+    subject->input_pending = 0;
 
     /* Settle who owns the value that is now stored. Ownership follows what the write
      * handed in: the input's if the mapper stored the input, the old value's if the
@@ -2141,6 +2169,9 @@ static void subject_commit_input(lv_subject_t * subject, const void * borrowed_i
         list_reposition(subject);
         return;
     }
+
+    /* A real change, so anything that read the old value is out of date. */
+    subject->version++;
 
     /* Phase 1: everything downstream is now stale. Always synchronous, so a read of a
      * dependent can never return a stale value. */
@@ -2165,9 +2196,55 @@ static void subject_commit_input(lv_subject_t * subject, const void * borrowed_i
 }
 
 
+/* Would re-running this Subject's mapper be pointless?
+ *
+ * A dirty Subject was marked stale because *something* upstream might have changed, not
+ * because anything definitely did. Bring its dependencies up to date and compare each
+ * against the version it read last time. If they all still match, the mapper is a
+ * function of unchanged inputs and cannot produce a different answer, so it is skipped —
+ * and because skipping leaves this Subject's own version alone, its dependents skip too,
+ * all the way up. One value that settles back to what it was therefore costs one
+ * evaluation, not one per level.
+ *
+ * Only for a dependency-driven re-evaluation: a direct write goes through
+ * `subject_input_written()` and always runs the mapper. */
+static bool deps_are_unchanged(lv_subject_t * subject)
+{
+    /* A deferred write lands here too, and then the input itself is new, so the mapper
+     * has to run whatever the dependencies say. */
+    if(subject->input_pending) return false;
+
+    uint32_t dep_cnt = ref_list_count(&subject->deps);
+    if(dep_cnt == 0) return false;   /* nothing recorded yet, so it has to run */
+
+    /* Two passes. Pulling a dependency runs arbitrary mapper and Observer code, which
+     * could in principle delete a Subject and relink this list, so nothing is compared
+     * while the list may be moving. */
+    for(uint32_t i = 0; i < dep_cnt; i++) {
+        subject_ref_t * ref = lv_ll_get_head(&subject->deps);
+        for(uint32_t k = 0; k < i && ref != NULL; k++) ref = lv_ll_get_next(&subject->deps, ref);
+        if(ref == NULL) return false;   /* the list changed under us: just run the mapper */
+        subject_pull(ref->subject);
+    }
+
+    if(ref_list_count(&subject->deps) != dep_cnt) return false;
+
+    subject_ref_t * ref;
+    LV_LL_READ(&subject->deps, ref) {
+        if(ref->seen_version != ref->subject->version) return false;
+    }
+    return true;
+}
+
 /* Re-evaluate a dirty Subject. */
 static void subject_recompute(lv_subject_t * subject)
 {
+    if(deps_are_unchanged(subject)) {
+        subject->dirty = 0;
+        list_reposition(subject);
+        return;
+    }
+
     subject_commit_input(subject, NULL, NULL, false);
 }
 

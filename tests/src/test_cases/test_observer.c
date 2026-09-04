@@ -4474,4 +4474,194 @@ void test_subject_accumulating_mapper_needs_eager(void)
     TEST_ASSERT_EQUAL(5, lv_subject_get_int(total_lazy));
 }
 
+
+/*=====================================================================
+ * "I need the previous value" is a stateful mapper, not missing API
+ *====================================================================*/
+
+/* An Observer that needs to know what the value *was* — to animate away what was there
+ * before, say — does not need the Subject to keep history. The mapper is handed the
+ * previous stored value in `*value`, and its `user_data` is a place to publish it. */
+typedef struct {
+    int32_t previous;
+    int32_t current;
+    bool seeded;
+} transition_t;
+
+static bool transition_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
+                              int32_t * value)
+{
+    LV_UNUSED(subject);
+    transition_t * t = user_data;
+
+    /* `*value` still holds the previous evaluation's result, which for a mirroring
+     * mapper is exactly the previous value. */
+    t->previous = t->seeded ? *value : input.num;
+    t->current = input.num;
+    t->seeded = true;
+
+    if(input.num == *value) return false;
+    *value = input.num;
+    return true;
+}
+
+void test_subject_previous_value_via_a_stateful_mapper(void)
+{
+    static transition_t tab;
+    lv_memzero(&tab, sizeof(tab));
+
+    lv_subject_t * current_tab = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(current_tab, transition_mapper, &tab);
+
+    /* An Observer makes it eager, so the mapper runs on every write. */
+    observer_called = 0;
+    lv_subject_add_observer(current_tab, observer_basic, NULL);
+    observer_called = 0;
+
+    lv_subject_set_int(current_tab, 0);
+    TEST_ASSERT_EQUAL(0, tab.current);
+
+    lv_subject_set_int(current_tab, 2);
+    TEST_ASSERT_EQUAL(0, tab.previous);
+    TEST_ASSERT_EQUAL(2, tab.current);
+    /* Which is all an animation needs: it moved forwards. */
+    TEST_ASSERT_TRUE(tab.current > tab.previous);
+
+    lv_subject_set_int(current_tab, 1);
+    TEST_ASSERT_EQUAL(2, tab.previous);
+    TEST_ASSERT_EQUAL(1, tab.current);
+    TEST_ASSERT_TRUE(tab.current < tab.previous);   /* backwards */
+
+    /* Writing the same value again is not a transition and notifies nobody. */
+    observer_called = 0;
+    lv_subject_set_int(current_tab, 1);
+    TEST_ASSERT_EQUAL(0, observer_called);
+    TEST_ASSERT_EQUAL(1, tab.current);
+}
+
+/* The state lives in the mapper's user_data, so one mapper serves several Subjects, each
+ * tracking its own transition. A file-scope static could not do that. */
+void test_subject_stateful_mapper_is_per_subject(void)
+{
+    static transition_t left;
+    static transition_t right;
+    lv_memzero(&left, sizeof(left));
+    lv_memzero(&right, sizeof(right));
+
+    lv_subject_t * a = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(a, transition_mapper, &left);
+    lv_subject_add_observer(a, observer_basic, NULL);
+
+    lv_subject_t * b = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(b, transition_mapper, &right);
+    lv_subject_add_observer(b, observer_basic, NULL);
+
+    lv_subject_set_int(a, 5);
+    lv_subject_set_int(a, 9);
+    lv_subject_set_int(b, 100);
+    lv_subject_set_int(b, 20);
+
+    TEST_ASSERT_EQUAL(5, left.previous);
+    TEST_ASSERT_EQUAL(9, left.current);
+    TEST_ASSERT_EQUAL(100, right.previous);
+    TEST_ASSERT_EQUAL(20, right.current);
+}
+
+
+/*=====================================================================
+ * A value that settles back costs one evaluation, not one per level
+ *====================================================================*/
+
+static lv_subject_t * sc_level1;
+static uint32_t sc_level1_runs;
+static uint32_t sc_level2_runs;
+
+/* Deliberately lossy, so two different inputs give the same output. */
+static bool sc_tenths_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
+                             int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    LV_UNUSED(input);
+    sc_level1_runs++;
+
+    int32_t next = lv_subject_get_int(dep_a) / 10;
+    if(next == *value) return false;   /* no change, so no version bump */
+    *value = next;
+    return true;
+}
+
+static bool sc_double_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
+                             int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    LV_UNUSED(input);
+    sc_level2_runs++;
+
+    int32_t next = lv_subject_get_int(sc_level1) * 2;
+    if(next == *value) return false;
+    *value = next;
+    return true;
+}
+
+void test_subject_no_change_stops_the_propagation(void)
+{
+    dep_a = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(dep_a, 10);
+
+    sc_level1 = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(sc_level1, sc_tenths_mapper, NULL);
+
+    lv_subject_t * level2 = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(level2, sc_double_mapper, NULL);
+    lv_subject_set_mode(level2, LV_SUBJECT_MODE_EAGER);
+
+    TEST_ASSERT_EQUAL(1, lv_subject_get_int(sc_level1));
+    TEST_ASSERT_EQUAL(2, lv_subject_get_int(level2));
+
+    /* 11 / 10 is still 1, so level1 reports no change. */
+    sc_level1_runs = 0;
+    sc_level2_runs = 0;
+    lv_subject_set_int(dep_a, 11);
+
+    /* level1 had to run to find that out. */
+    TEST_ASSERT_EQUAL(1, sc_level1_runs);
+    /* level2 did NOT: nothing it reads changed version, so its mapper was skipped
+     * rather than run to discover the same answer. */
+    TEST_ASSERT_EQUAL(0, sc_level2_runs);
+    TEST_ASSERT_EQUAL(2, lv_subject_get_int(level2));
+
+    /* A real change still propagates all the way. */
+    sc_level1_runs = 0;
+    sc_level2_runs = 0;
+    lv_subject_set_int(dep_a, 90);
+    TEST_ASSERT_EQUAL(1, sc_level1_runs);
+    TEST_ASSERT_EQUAL(1, sc_level2_runs);
+    TEST_ASSERT_EQUAL(9, lv_subject_get_int(sc_level1));
+    TEST_ASSERT_EQUAL(18, lv_subject_get_int(level2));
+}
+
+/* The short circuit must not swallow a direct write, including a deferred one, because
+ * then the pending work is the input itself rather than a stale dependency. */
+void test_subject_short_circuit_does_not_swallow_a_write(void)
+{
+    dep_a = subject_create(LV_SUBJECT_TYPE_INT);
+    dep_b = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(dep_a, 0);
+    lv_subject_set_int(dep_b, 100);
+
+    /* Reads its dependencies AND its own input, and is lazy, so the write is deferred. */
+    lv_subject_t * value = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(value, clamp_reactive_mapper, NULL);
+    TEST_ASSERT_FALSE(lv_subject_is_eager(value));
+
+    /* Neither limit changed, so only the write itself is new. */
+    lv_subject_set_int(value, 150);
+    TEST_ASSERT_EQUAL(100, lv_subject_get_int(value));
+
+    lv_subject_set_int(value, 40);
+    TEST_ASSERT_EQUAL(40, lv_subject_get_int(value));
+}
+
 #endif

@@ -191,7 +191,7 @@ static bool time_mapper(lv_subject_t * subject, void * user_data, lv_subject_val
 static void time_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     const datetime_t * datetime = lv_subject_get_pointer(subject);
-    lv_obj_t * label = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * label = lv_observer_get_target_obj(observer);
 
     if(datetime->format == TIME_FORMAT_24) {
         lv_label_set_text_fmt(label, "%" LV_PRId32 ":%02" LV_PRId32, datetime->hour, datetime->minute);
@@ -205,7 +205,7 @@ static void time_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 /*Change the hour options on format change*/
 static void hour_roller_options_update(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * roller = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * roller = lv_observer_get_target_obj(observer);
     int32_t prev_selected = lv_roller_get_selected(roller);
     int32_t v = lv_subject_get_int(subject);
     if(v == TIME_FORMAT_12) {

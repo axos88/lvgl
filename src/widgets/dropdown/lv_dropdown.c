@@ -1416,9 +1416,9 @@ static void dropdown_value_changed_event_cb(lv_event_t * e)
 static void dropdown_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
-    lv_dropdown_set_selected(observer->target, subject->value.num);
+    lv_dropdown_set_selected(lv_observer_get_target_obj(observer), subject->value.num);
 }
 
 #endif /*LV_USE_OBSERVER*/

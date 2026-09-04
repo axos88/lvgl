@@ -216,6 +216,14 @@ lv_obj_bind_string_mapped(label, temperature, lv_label_set_text, int_to_text);
 Like a Subject's mapper it owns change detection: when it returns `false` the Widget
 setter is not called at all.
 
+<Callout type="warning">
+An Observer's mapper is shaped differently from a Subject's. It has **no `input`
+parameter**, and `out` is the Observer's *own output slot* — the value it last pushed to
+the Widget, not the Subject's value. Read the observed value with
+<ApiLink name="lv_observer_get_subject" display="lv_observer_get_subject()" /> and the
+matching getter; `*out` exists only so the mapper can answer "did my output change?".
+</Callout>
+
 There is one function per output type:
 <ApiLink name="lv_obj_bind_bool_mapped" />, <ApiLink name="lv_obj_bind_int_mapped" />,
 <ApiLink name="lv_obj_bind_float_mapped" />, <ApiLink name="lv_obj_bind_string_mapped" />,

@@ -2017,47 +2017,48 @@ static void needle_deleted_cb(lv_event_t * e)
 static void scale_section_min_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT);
     lv_scale_section_t * section = lv_observer_get_user_data(observer);
     LV_ASSERT(section != NULL);
 
-    lv_scale_set_section_min_value(observer->target, section, subject->value.num);
+    lv_scale_set_section_min_value(lv_observer_get_target_obj(observer), section, subject->value.num);
 }
 
 static void scale_section_max_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT);
     lv_scale_section_t * section = lv_observer_get_user_data(observer);
     LV_ASSERT(section != NULL);
-    lv_scale_set_section_max_value(observer->target, section, subject->value.num);
+    lv_scale_set_section_max_value(lv_observer_get_target_obj(observer), section, subject->value.num);
 }
 
 static void scale_line_needle_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT);
     bind_element_needle_t * bind_element = lv_observer_get_user_data(observer);
     LV_ASSERT(bind_element != NULL);
-    lv_scale_set_line_needle_value(observer->target, bind_element->needle_line, bind_element->needle_length,
+    lv_scale_set_line_needle_value(lv_observer_get_target_obj(observer), bind_element->needle_line,
+                                   bind_element->needle_length,
                                    subject->value.num);
 }
 
 static void scale_image_needle_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT);
     lv_obj_t * needle_img = lv_observer_get_user_data(observer);
     LV_ASSERT(needle_img != NULL);
-    lv_scale_set_image_needle_value(observer->target, needle_img, subject->value.num);
+    lv_scale_set_image_needle_value(lv_observer_get_target_obj(observer), needle_img, subject->value.num);
 }
 
 #endif /*LV_USE_OBSERVER*/

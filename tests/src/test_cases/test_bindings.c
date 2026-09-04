@@ -200,7 +200,7 @@ static void create_ui(lv_subject_t * subject)
 static void chart_type_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     int32_t v = lv_subject_get_int(subject);
-    lv_obj_t * chart = lv_observer_get_target(observer);
+    lv_obj_t * chart = lv_observer_get_target_obj(observer);
     lv_chart_set_type(chart, v == 0 ? LV_CHART_TYPE_LINE : LV_CHART_TYPE_BAR);
 }
 

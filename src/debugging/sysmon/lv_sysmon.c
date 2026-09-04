@@ -375,7 +375,7 @@ static void perf_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
            perf->calculated.cpu);
 #endif
 #else
-    lv_obj_t * label = lv_observer_get_target(observer);
+    lv_obj_t * label = lv_observer_get_target_obj(observer);
     LV_ASSERT(label != NULL);
 #if LV_SYSMON_PROC_IDLE_AVAILABLE
     lv_label_set_text_fmt(
@@ -429,7 +429,7 @@ static void mem_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
     LV_ASSERT(subject != NULL);
-    lv_obj_t * label = lv_observer_get_target(observer);
+    lv_obj_t * label = lv_observer_get_target_obj(observer);
     const lv_mem_monitor_t * mon = lv_subject_get_pointer(subject);
     LV_ASSERT(label != NULL);
     LV_ASSERT(mon != NULL);

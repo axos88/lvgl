@@ -4976,15 +4976,16 @@ void test_observer_bind_style_opa_mapped(void)
  * Remaining public API
  *====================================================================*/
 
-/* Writes the value into whatever the Observer's target points at, which is what
- * lv_subject_add_observer_with_target() exists for: a target that is not a Widget. */
+/* Writes the value into whatever the Observer's user data points at. An Observer has one
+ * pointer for application data; a Widget, when there is one, is a separate lifetime link
+ * rather than a second data slot. */
 static void target_writing_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
-    int32_t * sink = lv_observer_get_target(observer);
+    int32_t * sink = lv_observer_get_user_data(observer);
     if(sink) *sink = lv_subject_get_int(subject);
 }
 
-void test_subject_add_observer_with_target(void)
+void test_subject_observer_user_data_carries_a_non_widget_target(void)
 {
     static int32_t sink;
     sink = 0;
@@ -4992,9 +4993,11 @@ void test_subject_add_observer_with_target(void)
     lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
     lv_subject_set_int(v, 3);
 
-    lv_observer_t * observer = lv_subject_add_observer_with_target(v, target_writing_cb, &sink, NULL);
+    lv_observer_t * observer = lv_subject_add_observer(v, target_writing_cb, &sink);
     TEST_ASSERT_NOT_NULL(observer);
-    TEST_ASSERT_EQUAL_PTR(&sink, lv_observer_get_target(observer));
+    TEST_ASSERT_EQUAL_PTR(&sink, lv_observer_get_user_data(observer));
+    /* Not bound to a Widget, so there is no Widget to report. */
+    TEST_ASSERT_NULL(lv_observer_get_target_obj(observer));
 
     /* Applied on subscribing, and on every change after. */
     TEST_ASSERT_EQUAL(3, sink);
@@ -5004,6 +5007,29 @@ void test_subject_add_observer_with_target(void)
     lv_observer_delete(observer);
     lv_subject_set_int(v, 99);
     TEST_ASSERT_EQUAL(8, sink);   /* no longer subscribed */
+}
+
+/* A Widget-bound Observer keeps its own user data, so both are available at once —
+ * which a single merged slot could not do. */
+void test_subject_observer_has_both_a_widget_and_user_data(void)
+{
+    static int32_t sink;
+    sink = 0;
+
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 5);
+
+    lv_obj_t * obj = lv_obj_create(lv_screen_active());
+    lv_observer_t * observer = lv_subject_add_observer_obj(v, target_writing_cb, obj, &sink);
+
+    TEST_ASSERT_EQUAL_PTR(obj, lv_observer_get_target_obj(observer));
+    TEST_ASSERT_EQUAL_PTR(&sink, lv_observer_get_user_data(observer));
+    TEST_ASSERT_EQUAL(5, sink);
+
+    /* And the Widget is still the lifetime link: deleting it unsubscribes. */
+    lv_obj_delete(obj);
+    lv_subject_set_int(v, 42);
+    TEST_ASSERT_EQUAL(5, sink);
 }
 
 /* lv_subject_notify() forces a notification without changing the value, which is what a
@@ -5244,5 +5270,143 @@ void test_subject_increment_event_on_a_float(void)
     TEST_ASSERT_EQUAL_FLOAT(6.0f, lv_subject_get_float(v));   /* 10 > 9, so back to the minimum */
 }
 #endif
+
+
+/*=====================================================================
+ * Releasing what the application attached to a Subject
+ *====================================================================*/
+
+static uint32_t delete_cb_calls;
+static lv_subject_t * delete_cb_saw_subject;
+static void * delete_cb_saw_user_data;
+
+static void recording_delete_cb(lv_subject_t * subject, void * user_data)
+{
+    delete_cb_calls++;
+    delete_cb_saw_subject = subject;
+    delete_cb_saw_user_data = user_data;
+}
+
+void test_subject_delete_cb_runs_on_delete(void)
+{
+    static int32_t token;
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 4);
+    lv_subject_set_delete_cb(v, recording_delete_cb, &token);
+
+    delete_cb_calls = 0;
+    delete_cb_saw_subject = NULL;
+    delete_cb_saw_user_data = NULL;
+
+    subject_delete(v);
+
+    TEST_ASSERT_EQUAL(1, delete_cb_calls);
+    TEST_ASSERT_EQUAL_PTR(v, delete_cb_saw_subject);
+    TEST_ASSERT_EQUAL_PTR(&token, delete_cb_saw_user_data);
+}
+
+/* It runs before the Subject is taken apart, so the callback can still read it. */
+static int32_t value_seen_at_delete;
+
+static void reading_delete_cb(lv_subject_t * subject, void * user_data)
+{
+    LV_UNUSED(user_data);
+    value_seen_at_delete = lv_subject_get_int(subject);
+}
+
+void test_subject_delete_cb_sees_an_intact_subject(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 77);
+    lv_subject_set_delete_cb(v, reading_delete_cb, NULL);
+
+    value_seen_at_delete = 0;
+    subject_delete(v);
+    TEST_ASSERT_EQUAL(77, value_seen_at_delete);
+}
+
+/* Cascade destroys several Subjects, and each one's callback has to run. */
+void test_subject_delete_cb_runs_for_every_cascaded_subject(void)
+{
+    dep_a = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(dep_a, 1);
+
+    chain_l1 = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(chain_l1, chain_l1_mapper, NULL);
+    chain_l2 = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(chain_l2, chain_l2_mapper, NULL);
+    (void)lv_subject_get_int(chain_l2);
+
+    lv_subject_set_delete_cb(dep_a, recording_delete_cb, NULL);
+    lv_subject_set_delete_cb(chain_l1, recording_delete_cb, NULL);
+    lv_subject_set_delete_cb(chain_l2, recording_delete_cb, NULL);
+
+    subject_forget(dep_a);
+    subject_forget(chain_l1);
+    subject_forget(chain_l2);
+
+    delete_cb_calls = 0;
+    lv_subject_delete_cascade(dep_a);
+    TEST_ASSERT_EQUAL(3, delete_cb_calls);
+}
+
+/* A refused delete must not run it: the Subject is still alive. */
+void test_subject_delete_cb_not_run_when_delete_is_refused(void)
+{
+    dep_a = subject_create(LV_SUBJECT_TYPE_INT);
+    dep_b = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(dep_a, 1);
+    lv_subject_set_int(dep_b, 1);
+
+    lv_subject_t * sum = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(sum, sum_mapper, NULL);
+    (void)lv_subject_get_int(sum);
+
+    lv_subject_set_delete_cb(dep_a, recording_delete_cb, NULL);
+
+    delete_cb_calls = 0;
+    lv_subject_delete(dep_a);          /* refused: `sum` reads it */
+    TEST_ASSERT_EQUAL(0, delete_cb_calls);
+    TEST_ASSERT_EQUAL(1, lv_subject_get_int(dep_a));
+}
+
+/* The one-call form for the common case: a mapper whose captured state is allocated. */
+void test_subject_owned_mapper_user_data_is_freed(void)
+{
+    uint32_t mem_before = lv_test_get_free_mem();
+
+    for(uint32_t i = 0; i < 32; i++) {
+        lv_subject_t * left = lv_subject_create(LV_SUBJECT_TYPE_INT);
+        lv_subject_t * right = lv_subject_create(LV_SUBJECT_TYPE_INT);
+        lv_subject_set_int(left, (int32_t)i);
+        lv_subject_set_int(right, 1);
+
+        pair_t * cfg = lv_malloc(sizeof(pair_t));
+        cfg->left = left;
+        cfg->right = right;
+
+        lv_subject_t * sum = lv_subject_create(LV_SUBJECT_TYPE_INT);
+        lv_subject_set_int_mapper(sum, pair_sum_mapper, cfg);
+        lv_subject_set_mapper_user_data_owned(sum);
+        TEST_ASSERT_EQUAL_PTR(cfg, lv_subject_get_mapper_user_data(sum));
+        TEST_ASSERT_EQUAL((int32_t)i + 1, lv_subject_get_int(sum));
+
+        lv_subject_delete(sum);     /* releases cfg */
+        lv_subject_delete(left);
+        lv_subject_delete(right);
+    }
+
+    /* Nothing accumulates, so the allocation really is released each time. */
+    TEST_ASSERT_MEM_LEAK_LESS_THAN(mem_before, 32);
+}
+
+void test_subject_mapper_user_data_owned_needs_a_mapper(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+
+    /* No mapper yet, so there is nothing to own: refused rather than silently armed. */
+    lv_subject_set_mapper_user_data_owned(v);
+    TEST_ASSERT_NULL(lv_subject_get_mapper_user_data(v));
+}
 
 #endif

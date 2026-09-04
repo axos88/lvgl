@@ -32,15 +32,17 @@ extern "C" {
 struct _lv_observer_t {
     lv_subject_t * subject;             /**< Observed subject */
     lv_observer_cb_t cb;                /**< Callback that notifies when value changes */
-    void * target;                      /**< A target for the observer, e.g. a widget or any pointer */
-    void * user_data;                   /**< Additional parameter, can be used freely by user */
+    lv_obj_t * obj;                     /**< The Widget this Observer is bound to, or NULL.
+                                         * Only for lifetime: the Widget's deletion deletes
+                                         * the Observer. Application data goes in `user_data`. */
+    void * user_data;                   /**< Passed to the callback; the single place for
+                                         * application data */
     void (*user_cb)(void);              /**< Additional function pointer, can be used freely by user */
-    lv_observer_mapper_t mapper;        /**< Maps the subject's value to what is pushed to `target` */
+    lv_observer_mapper_t mapper;        /**< Maps the subject's value to what is pushed out */
     lv_subject_value_t out;             /**< Last value the mapper produced */
     lv_style_selector_t style_selector; /**< Part and state, for a style binding */
     uint32_t auto_free_user_data : 1;   /**< Automatically free user data when observer is removed */
     uint32_t notified : 1;              /**< Was observer already notified? */
-    uint32_t for_obj : 1;               /**< Is `target` a pointer to a Widget (`lv_obj_t *`)? */
     uint32_t mode : 1;                  /**< One of the LV_OBSERVER_MODE_... values */
     uint32_t has_mapper : 1;            /**< Is `mapper` set? */
 };

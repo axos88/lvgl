@@ -211,6 +211,15 @@ typedef union {
 } lv_subject_mapper_t;
 
 /**
+ * Called just before a Subject is destroyed, to release whatever the application
+ * attached to it. See @ref lv_subject_set_delete_cb.
+ * @param subject     the Subject being destroyed. Still readable, but must not be
+ *                    written or deleted from here.
+ * @param user_data   the pointer given to `lv_subject_set_delete_cb()`
+ */
+typedef void (*lv_subject_delete_cb_t)(lv_subject_t * subject, void * user_data);
+
+/**
  * Grows the buffer of a Subject that copies its value.
  * @param buf    the current buffer @nullable NULL on the first allocation
  * @param size   the number of bytes needed
@@ -258,6 +267,8 @@ struct _lv_subject_t {
     void * mapper_user_data;             /**< Passed to `mapper`, the mapper's captured state */
     lv_subject_value_free_cb_t value_free_cb; /**< Releases an owned pointer value */
     lv_subject_buf_t * buf;              /**< Set when the Subject copies its value @nullable */
+    lv_subject_delete_cb_t delete_cb;    /**< Called just before the Subject is destroyed @nullable */
+    void * delete_user_data;             /**< Passed to `delete_cb` @nullable */
     void * user_data;                    /**< Additional parameter, can be used freely by user */
 
     lv_ll_t deps;                        /**< Subjects this one read during its last evaluation */
@@ -310,7 +321,12 @@ typedef void (*lv_observer_cb_t)(lv_observer_t * observer, lv_subject_t * subjec
  * Runs when the Observer is notified, before the value reaches its target, so a
  * Subject of any type can drive an integer target.
  * @param observer  pointer to Observer
- * @param out       pointer to the Observer's output slot, holding the last pushed value
+ * @param out       in/out pointer to the Observer's **own output slot**, holding the
+ *                  value it last pushed to the target. This is not the Subject's value:
+ *                  an Observer's mapper has no `input` parameter, so read the observed
+ *                  value with `lv_observer_get_subject()` and the matching
+ *                  `lv_subject_get_...()`. `*out` is there so the mapper can answer
+ *                  "did my output change?".
  * @return          `true` if the mapper changed `*out`. When `false` the target is
  *                  not updated at all.
  * @note            Read the observed value with `lv_observer_get_subject()` and the
@@ -515,6 +531,69 @@ void lv_subject_delete(lv_subject_t * subject);
  *                  is deleted too. Pointers to them become invalid.
  */
 void lv_subject_delete_cascade(lv_subject_t * subject);
+
+/**
+ * Register a callback to run just before a Subject is destroyed.
+ *
+ * Use it to release anything the application attached to the Subject and cannot
+ * otherwise reach at the right moment — a mapper's `user_data`, a file handle, a
+ * registration in some other list. It runs on `lv_subject_delete()`,
+ * `lv_subject_delete_cascade()`, and on the automatic teardown in `lv_deinit()`, so
+ * there is no path that destroys a Subject without it.
+ *
+ * ```c
+ * static void free_config(lv_subject_t * subject, void * user_data)
+ * {
+ *     LV_UNUSED(subject);
+ *     lv_free(user_data);
+ * }
+ *
+ * range_t * cfg = lv_malloc(sizeof(range_t));
+ * lv_subject_set_int_mapper(bounded, clamp_mapper, cfg);
+ * lv_subject_set_delete_cb(bounded, free_config, cfg);
+ * ```
+ *
+ * @param subject   pointer to Subject
+ * @param cb        the callback, or NULL to remove the current one @nullable
+ * @param user_data passed to the callback @nullable
+ *
+ * @note It runs *before* the Subject is taken apart, so the Subject is still readable.
+ *       Do not write it, delete it, or delete another Subject from the callback.
+ * @note For the common case of a mapper's `user_data` being a plain `lv_malloc()`
+ *       allocation, `lv_subject_set_mapper_user_data_owned()` says the same thing in one
+ *       call and needs no callback at all.
+ */
+void lv_subject_set_delete_cb(lv_subject_t * subject, lv_subject_delete_cb_t cb, void * user_data);
+
+/**
+ * Hand the Subject ownership of its mapper's `user_data`, so it is released with
+ * `lv_free()` when the Subject is destroyed.
+ *
+ * This is the one-call form of the common case: a mapper whose captured state is
+ * allocated rather than static.
+ *
+ * ```c
+ * range_t * cfg = lv_malloc(sizeof(range_t));
+ * cfg->min = 0;
+ * cfg->max = 100;
+ * lv_subject_set_int_mapper(bounded, clamp_mapper, cfg);
+ * lv_subject_set_mapper_user_data_owned(bounded);   // freed with the Subject
+ * ```
+ *
+ * @param subject   pointer to Subject, which must already have a mapper set
+ * @note            The data has to be freeable with `lv_free()`. For anything else, use
+ *                  `lv_subject_set_delete_cb()`.
+ * @note            Replacing the mapper does *not* release the old `user_data`; set the
+ *                  mapper and its data first, then call this.
+ */
+void lv_subject_set_mapper_user_data_owned(lv_subject_t * subject);
+
+/**
+ * Get the pointer that was given to the Subject's mapper setter.
+ * @param subject   pointer to Subject
+ * @return          the mapper's user data, or NULL if it has no mapper
+ */
+void * lv_subject_get_mapper_user_data(const lv_subject_t * subject);
 
 /**
  * Initialize an integer-type Subject.
@@ -1144,7 +1223,8 @@ lv_observer_t * lv_subject_add_observer(lv_subject_t * subject, lv_observer_cb_t
  * @param subject       pointer to Subject
  * @param observer_cb   notification callback
  * @param obj           pointer to Widget. @nullable When NULL the Observer is not
- *                      bound to a Widget.
+ *                      bound to a Widget. The Widget is only a lifetime link: deleting
+ *                      it deletes the Observer. Application data goes in `user_data`.
  * @param user_data     optional user data @nullable
  * @return              pointer to newly-created Observer
  * @note                Do not call `lv_observer_delete()` on Observers created this way.
@@ -1156,16 +1236,6 @@ lv_observer_t * lv_subject_add_observer(lv_subject_t * subject, lv_observer_cb_t
 lv_observer_t * lv_subject_add_observer_obj(lv_subject_t * subject, lv_observer_cb_t observer_cb, lv_obj_t * obj,
                                             void * user_data);
 
-/**
- * Add an Observer to a Subject and also save a target pointer.
- * @param subject       pointer to Subject
- * @param observer_cb   notification callback
- * @param target        any pointer @nullable
- * @param user_data     optional user data @nullable
- * @return              pointer to newly-created Observer
- */
-lv_observer_t * lv_subject_add_observer_with_target(lv_subject_t * subject, lv_observer_cb_t observer_cb,
-                                                    void * target, void * user_data);
 
 /**
  * Remove Observer from its Subject.
@@ -1183,19 +1253,14 @@ void lv_observer_delete(lv_observer_t * observer);
  */
 void lv_obj_remove_from_subject(lv_obj_t * obj, lv_subject_t * subject);
 
-/**
- * Get target of an Observer.
- * @param observer      pointer to Observer
- * @return              pointer to saved target
- */
-void * lv_observer_get_target(lv_observer_t * observer);
 
 /**
- * Get target Widget of Observer.
- * This is the same as `lv_observer_get_target()`, except it returns `target`
- * as an `lv_obj_t *`.
+ * Get the Widget an Observer is bound to.
  * @param observer      pointer to Observer
- * @return              pointer to saved Widget target
+ * @return              the Widget, or NULL if the Observer is not bound to one
+ * @note                An Observer has one pointer for application data,
+ *                      `lv_observer_get_user_data()`. The Widget is separate because it
+ *                      is a lifetime link, not data.
  */
 lv_obj_t * lv_observer_get_target_obj(lv_observer_t * observer);
 

@@ -690,7 +690,7 @@ static void sysmon_perf_observer_cb(lv_observer_t * observer, lv_subject_t * sub
     }
 
 #if !LV_USE_PERF_MONITOR_LOG_MODE
-    lv_obj_t * label = lv_observer_get_target(observer);
+    lv_obj_t * label = lv_observer_get_target_obj(observer);
     lv_label_set_text_fmt(label,
                           "%s"
                           "%" LV_PRIu32" FPS, %" LV_PRIu32 "%% CPU\n"

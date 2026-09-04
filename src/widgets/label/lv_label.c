@@ -1557,26 +1557,26 @@ static void calculate_x_coordinate(int32_t * x, const lv_text_align_t align, con
 static void label_text_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     const char * fmt = lv_observer_get_user_data(observer);
 
     if(fmt == NULL) {
-        lv_label_set_text(observer->target, subject->value.pointer);
+        lv_label_set_text(lv_observer_get_target_obj(observer), subject->value.pointer);
     }
     else {
         switch(subject->type) {
             case LV_SUBJECT_TYPE_INT:
-                lv_label_set_text_fmt(observer->target, fmt, subject->value.num);
+                lv_label_set_text_fmt(lv_observer_get_target_obj(observer), fmt, subject->value.num);
                 break;
 #if LV_USE_FLOAT
             case LV_SUBJECT_TYPE_FLOAT:
-                lv_label_set_text_fmt(observer->target, fmt, subject->value.float_v);
+                lv_label_set_text_fmt(lv_observer_get_target_obj(observer), fmt, subject->value.float_v);
                 break;
 #endif
             case LV_SUBJECT_TYPE_STRING:
             case LV_SUBJECT_TYPE_POINTER:
-                lv_label_set_text_fmt(observer->target, fmt, subject->value.pointer);
+                lv_label_set_text_fmt(lv_observer_get_target_obj(observer), fmt, subject->value.pointer);
                 break;
             default:
                 break;

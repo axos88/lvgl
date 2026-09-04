@@ -88,7 +88,7 @@ static void cont_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
      *remembers it itself. Only this observer cares about the direction of the change.*/
     static int32_t prev_v = 0;
     int32_t cur_v = lv_subject_get_int(subject);
-    lv_obj_t * cont = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * cont = lv_observer_get_target_obj(observer);
 
     /*Animate out the previous content*/
     lv_anim_t a;
@@ -186,7 +186,7 @@ static void btn_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     int32_t cur_v = lv_subject_get_int(subject);
 
-    lv_obj_t * btn = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * btn = lv_observer_get_target_obj(observer);
     int32_t idx = (int32_t)lv_obj_get_index(btn);
 
     /*Derive the state from the current value only. This needs no previous value, which
@@ -198,7 +198,7 @@ static void btn_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 static void indicator_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     int32_t cur_v = lv_subject_get_int(subject);
-    lv_obj_t * indicator = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * indicator = lv_observer_get_target_obj(observer);
 
     lv_obj_t * footer = lv_obj_get_parent(indicator);
     lv_obj_t * btn_act = lv_obj_get_child(footer, cur_v);

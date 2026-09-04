@@ -160,6 +160,34 @@ observer, or being declared eager — repositions it first.
   place) or `lv_subject_create_clamped()` (a separate bounded mirror).
 - `prev_value` and the five `lv_subject_get_previous_*()`.
 
+### 1.9 An observer has one pointer for application data
+
+An observer used to carry two general-purpose pointers, `target` and `user_data`, doing
+the same job. `target`'s generic role is gone, along with
+`lv_subject_add_observer_with_target()` and `lv_observer_get_target()`; `user_data` is
+the single place for application data.
+
+The widget slot stays, because it is not data. It is a **lifetime link**: the widget's
+deletion deletes the observer, and `lv_observer_delete()` needs the widget pointer to
+unhook that event. Merging it into `user_data` would relocate the special case rather
+than remove it, and would cost the ability to have both — which several of LVGL's own
+bindings need, `lv_obj_style.c` among them, keeping a descriptor in `user_data` and
+reaching the widget separately.
+
+So the struct lost one pointer and one flag bit (`for_obj`), and the API lost two
+functions, with no capability lost.
+
+### 1.10 Releasing what the application attached
+
+`lv_subject_set_delete_cb()` runs a callback just before a subject is destroyed, on every
+path that destroys one. `lv_subject_set_mapper_user_data_owned()` is the one-call form
+for the common case, and needs no new storage because it reuses the ownership bit the
+`lv_subject_create_min/max/clamped()` helpers already used internally.
+
+`lv_subject_set_external_data()` also released on deletion, but it sits behind
+`LV_USE_EXT_DATA`, which is off by default, and it is a separate slot from the mapper's
+`user_data` — so it did not answer the question it looked like it answered.
+
 ### 1.9 Forwarding a subject to a widget setter
 
 `lv_obj_bind_int()` and friends already forward to a setter shaped
@@ -226,7 +254,7 @@ none.
 - `python3 tests/main.py test --build-options OPTIONS_TEST_DEFHEAP` — 183/183 pass.
 - `python3 tests/main.py build` — every configuration compiles, including
   `OPTIONS_MINIMAL` with `LV_USE_OBSERVER 0`, and the examples.
-- `test_observer.c` covers 174 cases.
+- `test_observer.c` covers 181 cases.
 
 Measured coverage of `src/core/lv_observer.c` (gcov, `OPTIONS_TEST_DEFHEAP`):
 

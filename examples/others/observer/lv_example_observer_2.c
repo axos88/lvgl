@@ -77,7 +77,7 @@ static void textarea_event_cb(lv_event_t * e)
 
 static void info_label_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * label = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * label = lv_observer_get_target_obj(observer);
     switch(lv_subject_get_int(subject)) {
         case LOGGED_IN:
             lv_label_set_text(label, "Login successful");

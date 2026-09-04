@@ -1544,7 +1544,7 @@ static void bind_style_observer_cb(lv_observer_t * observer, lv_subject_t * subj
 
     int32_t v = lv_subject_get_int(subject);
     bool dis = (v != p->value);
-    lv_obj_style_set_disabled(observer->target, p->style, p->selector, dis);
+    lv_obj_style_set_disabled(lv_observer_get_target_obj(observer), p->style, p->selector, dis);
 }
 
 static void bind_style_prop_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
@@ -1560,7 +1560,7 @@ static void bind_style_prop_observer_cb(lv_observer_t * observer, lv_subject_t *
         return;
     }
 
-    lv_obj_set_local_style_prop(observer->target, p->prop, style_v, p->selector);
+    lv_obj_set_local_style_prop(lv_observer_get_target_obj(observer), p->prop, style_v, p->selector);
 }
 
 

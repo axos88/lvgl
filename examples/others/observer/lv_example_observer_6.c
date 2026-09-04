@@ -13,13 +13,13 @@ static void switch_theme_event_cb(lv_event_t * e);
 static lv_subject_t * theme_subject;
 
 /**
- * @title Theme styles with `lv_subject_add_observer_with_target`
+ * @title Theme styles with `lv_subject_add_observer`
  * @brief Recolour two style sets when a theme subject flips between light and dark.
  *
  * `theme_subject` starts at `THEME_MODE_DARK`. A panel with ten child buttons is
  * built with encapsulated factory helpers; each helper registers its own
  * `lv_panel_styles_t` or `lv_button_styles_t` through
- * `lv_subject_add_observer_with_target` so the observer gets the style bundle as
+ * `lv_subject_add_observer` so the observer gets the style bundle as
  * its target. The observers rewrite background, shadow, text, and gradient
  * colours per mode and call `lv_obj_report_style_change`. Any button click
  * toggles the subject.
@@ -71,7 +71,7 @@ static void my_panel_style_observer_cb(lv_observer_t * observer, lv_subject_t * 
     LV_UNUSED(subject);
 
     lv_theme_mode_t m = (lv_theme_mode_t) lv_subject_get_int(theme_subject);
-    lv_panel_styles_t * styles = (lv_panel_styles_t *) lv_observer_get_target(observer);
+    lv_panel_styles_t * styles = (lv_panel_styles_t *) lv_observer_get_user_data(observer);
     if(m == THEME_MODE_LIGHT) {
         lv_style_set_bg_color(&styles->style_main, lv_color_hex3(0xfff));
         lv_style_set_shadow_color(&styles->style_main, lv_color_hex3(0x888));
@@ -112,7 +112,7 @@ static lv_obj_t * my_panel_create(lv_obj_t * parent)
         lv_style_set_pad_ver(&styles.style_scrollbar, 8);
         lv_style_set_bg_opa(&styles.style_scrollbar, LV_OPA_50);
 
-        lv_subject_add_observer_with_target(theme_subject, my_panel_style_observer_cb, &styles, NULL);
+        lv_subject_add_observer(theme_subject, my_panel_style_observer_cb, &styles);
     }
 
     lv_obj_t * panel = lv_obj_create(parent);
@@ -140,7 +140,7 @@ static void my_button_style_observer_cb(lv_observer_t * observer, lv_subject_t *
     LV_UNUSED(subject);
 
     lv_theme_mode_t m = (lv_theme_mode_t) lv_subject_get_int(theme_subject);
-    lv_button_styles_t * styles = (lv_button_styles_t *) lv_observer_get_target(observer);
+    lv_button_styles_t * styles = (lv_button_styles_t *) lv_observer_get_target_obj(observer);
     if(m == THEME_MODE_LIGHT) {
         lv_style_set_bg_color(&styles->style_main, lv_color_hex(0x3379de));
         lv_style_set_bg_grad_color(&styles->style_main, lv_color_hex(0xd249a5));
@@ -180,7 +180,7 @@ static lv_obj_t * my_button_create(lv_obj_t * parent, const char * text, lv_even
 
         lv_style_init(&styles.style_pressed);
         lv_style_set_color_filter_dsc(&styles.style_pressed, &lv_color_filter_shade);
-        lv_subject_add_observer_with_target(theme_subject, my_button_style_observer_cb, &styles, NULL);
+        lv_subject_add_observer(theme_subject, my_button_style_observer_cb, &styles);
     }
 
     lv_obj_t * btn = lv_button_create(parent);

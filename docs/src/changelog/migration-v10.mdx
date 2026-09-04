@@ -939,6 +939,70 @@ something actually moved — which otherwise needs a mapper keeping a last-known
 A Subject either copies or refers: setting a buffer makes the borrowing and owning
 setters refuse, and the copying functions need a buffer.
 
+### An Observer has one pointer for application data
+
+`lv_subject_add_observer_with_target()` and `lv_observer_get_target()` are **removed**.
+An Observer used to carry two general-purpose pointers, `target` and `user_data`, which
+did the same job; now there is one:
+
+```c
+/* Before */
+lv_subject_add_observer_with_target(subject, cb, my_data, NULL);
+my_data_t * d = lv_observer_get_target(observer);
+
+/* After */
+lv_subject_add_observer(subject, cb, my_data);
+my_data_t * d = lv_observer_get_user_data(observer);
+```
+
+The Widget slot stays, because it is not data:
+`lv_subject_add_observer_obj(subject, cb, obj, user_data)` still takes both, and the
+Widget is a **lifetime link** — deleting it deletes the Observer. An Observer bound to a
+Widget therefore still has its own `user_data`, which is what several of LVGL's own
+bindings rely on: they keep a descriptor in `user_data` and the Widget separately.
+
+`lv_observer_get_target_obj()` is unchanged and now simply returns that Widget. If you
+were using `lv_observer_get_target()` to get a Widget, switch to it:
+
+```c
+/* Before */
+lv_obj_t * label = lv_observer_get_target(observer);
+
+/* After */
+lv_obj_t * label = lv_observer_get_target_obj(observer);
+```
+
+### Releasing what you attached to a Subject
+
+`lv_subject_set_delete_cb()` registers a callback that runs just before a Subject is
+destroyed, on `lv_subject_delete()`, `lv_subject_delete_cascade()` and the automatic
+teardown in `lv_deinit()`. Use it to release anything the application attached — a
+mapper's `user_data`, a handle, a registration elsewhere:
+
+```c
+static void free_config(lv_subject_t * subject, void * user_data)
+{
+    LV_UNUSED(subject);
+    lv_free(user_data);
+}
+
+lv_subject_set_int_mapper(bounded, clamp_mapper, cfg);
+lv_subject_set_delete_cb(bounded, free_config, cfg);
+```
+
+For the common case of a mapper's `user_data` being a plain `lv_malloc()` allocation,
+`lv_subject_set_mapper_user_data_owned()` says it in one call and needs no callback:
+
+```c
+lv_subject_set_int_mapper(bounded, clamp_mapper, lv_malloc(sizeof(range_t)));
+lv_subject_set_mapper_user_data_owned(bounded);
+```
+
+This is what makes it practical to hand a mapper allocated state rather than a static.
+Note that `lv_subject_set_external_data()` also releases on deletion, but it is behind
+`LV_USE_EXT_DATA`, which is off by default, and it is a separate slot from the mapper's
+`user_data`.
+
 ### Immediate and batched Observers
 
 An Observer's mode says **when it is notified**, and it is also what decides whether a

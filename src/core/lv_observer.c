@@ -482,6 +482,33 @@ void lv_subject_delete(lv_subject_t * subject)
     subject_destroy(subject);
 }
 
+void lv_subject_set_delete_cb(lv_subject_t * subject, lv_subject_delete_cb_t cb, void * user_data)
+{
+    LV_CHECK_ARG(subject != NULL, return);
+
+    subject->delete_cb = cb;
+    subject->delete_user_data = user_data;
+}
+
+void lv_subject_set_mapper_user_data_owned(lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return);
+
+    if(!subject->has_mapper) {
+        LV_LOG_WARN("Set the mapper and its user data first, then hand over ownership");
+        return;
+    }
+
+    subject->owns_mapper_user_data = 1;
+}
+
+void * lv_subject_get_mapper_user_data(const lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return NULL);
+
+    return subject->mapper_user_data;
+}
+
 void lv_subject_delete_cascade(lv_subject_t * subject)
 {
     if(!subject) {
@@ -921,7 +948,6 @@ lv_observer_t * lv_subject_add_observer(lv_subject_t * subject, lv_observer_cb_t
     lv_observer_t * observer = lv_subject_add_observer_obj(subject, observer_cb, NULL, user_data);
     if(observer == NULL) return NULL;
 
-    observer->for_obj = 0;
     return observer;
 }
 
@@ -943,8 +969,7 @@ lv_observer_t * lv_subject_add_observer_obj(lv_subject_t * subject, lv_observer_
     observer->subject = subject;
     observer->cb = observer_cb;
     observer->user_data = user_data;
-    observer->target = obj;
-    observer->for_obj = 1;
+    observer->obj = obj;
     subject->immediate_observer_cnt++;  /* LV_OBSERVER_MODE_IMMEDIATE is the default */
     /* subscribe to delete event of the object */
     if(obj != NULL) {
@@ -957,41 +982,15 @@ lv_observer_t * lv_subject_add_observer_obj(lv_subject_t * subject, lv_observer_
     return observer;
 }
 
-lv_observer_t * lv_subject_add_observer_with_target(lv_subject_t * subject, lv_observer_cb_t observer_cb, void * target,
-                                                    void * user_data)
-{
-    LV_CHECK_ARG(subject != NULL, return NULL);
-    LV_CHECK_ARG(observer_cb != NULL, return NULL);
-    LV_CHECK_ARG(subject->type != LV_SUBJECT_TYPE_INVALID, return NULL);
-
-    settle_before_subscribe(subject);
-
-    lv_observer_t * observer = lv_ll_ins_tail(&(subject->subs_ll));
-    LV_ASSERT_MALLOC(observer);
-    if(observer == NULL) return NULL;
-
-    lv_memzero(observer, sizeof(*observer));
-
-    observer->subject = subject;
-    observer->cb = observer_cb;
-    observer->user_data = user_data;
-    observer->target = target;
-    subject->immediate_observer_cnt++;  /* LV_OBSERVER_MODE_IMMEDIATE is the default */
-
-    /* Update Observer immediately. */
-    observer->cb(observer, subject);
-
-    return observer;
-}
 
 
 void lv_observer_delete(lv_observer_t * observer)
 {
     if(observer == NULL) return;
 
-    if(observer->for_obj && observer->target) {
-        lv_obj_remove_event_cb_with_user_data(observer->target, unsubscribe_on_delete_cb, observer);
-        lv_obj_remove_event_cb_with_user_data(observer->target, NULL, observer->subject);
+    if(observer->obj) {
+        lv_obj_remove_event_cb_with_user_data(observer->obj, unsubscribe_on_delete_cb, observer);
+        lv_obj_remove_event_cb_with_user_data(observer->obj, NULL, observer->subject);
     }
 
     observer->subject->notify_restart_query = 1;
@@ -1040,12 +1039,6 @@ void lv_obj_remove_from_subject(lv_obj_t * obj, lv_subject_t * subject)
 
 }
 
-void * lv_observer_get_target(lv_observer_t * observer)
-{
-    LV_CHECK_ARG(observer != NULL, return NULL);
-
-    return observer->target;
-}
 
 void lv_subject_notify(lv_subject_t * subject)
 {
@@ -1575,7 +1568,7 @@ lv_obj_t * lv_observer_get_target_obj(lv_observer_t * observer)
 {
     LV_CHECK_ARG(observer != NULL, return NULL);
 
-    return (lv_obj_t *)lv_observer_get_target(observer);
+    return observer->obj;
 }
 
 void * lv_observer_get_user_data(const lv_observer_t * observer)
@@ -2676,13 +2669,12 @@ static lv_observer_t * bind_mapped(lv_obj_t * obj, lv_subject_t * subject, lv_ob
     lv_memzero(observer, sizeof(*observer));
     observer->subject = subject;
     observer->cb = cb;
-    observer->target = obj;
+    observer->obj = obj;
     observer->user_cb = set_cb;
     observer->mapper = mapper;
     observer->user_data = user_data;
     observer->style_selector = selector;
     observer->has_mapper = 1;
-    observer->for_obj = 1;
     subject->immediate_observer_cnt++;  /* LV_OBSERVER_MODE_IMMEDIATE is the default */
 
     if(obj != NULL) lv_obj_add_event_cb(obj, unsubscribe_on_delete_cb, LV_EVENT_DELETE, observer);
@@ -2768,6 +2760,17 @@ static void init_string(lv_subject_t * subject, char * buf, size_t size, const c
 static void deinit(lv_subject_t * subject)
 {
     LV_ASSERT(subject != NULL);
+
+    /* First, while the Subject is still whole, so the callback can read it and reach
+     * whatever it has to release. Cleared before the call so a callback that somehow
+     * re-enters cannot run it twice. */
+    if(subject->delete_cb) {
+        lv_subject_delete_cb_t cb = subject->delete_cb;
+        void * cb_user_data = subject->delete_user_data;
+        subject->delete_cb = NULL;
+        subject->delete_user_data = NULL;
+        cb(subject, cb_user_data);
+    }
 
     /* Both directions, so deleting a Subject in the middle of a graph leaves no
      * dangling edge in its dependencies or its dependents. */
@@ -2971,10 +2974,10 @@ static void obj_flag_observer_cb(lv_observer_t * observer, lv_subject_t * subjec
     /*TODO: the flag binding API is deprecated separately; suppress the warning until then*/
     LV_DEPRECATIONS_IGNORE_BEGIN
     if(res) {
-        lv_obj_add_flag(observer->target, p->flag);
+        lv_obj_add_flag(observer->obj, p->flag);
     }
     else {
-        lv_obj_remove_flag(observer->target, p->flag);
+        lv_obj_remove_flag(observer->obj, p->flag);
     }
     LV_DEPRECATIONS_IGNORE_END
 }
@@ -3002,10 +3005,10 @@ static void obj_state_observer_cb(lv_observer_t * observer, lv_subject_t * subje
     if(p->inv) res = !res;
 
     if(res) {
-        lv_obj_add_state(observer->target, p->flag);
+        lv_obj_add_state(observer->obj, p->flag);
     }
     else {
-        lv_obj_remove_state(observer->target, p->flag);
+        lv_obj_remove_state(observer->obj, p->flag);
     }
 }
 
@@ -3032,7 +3035,7 @@ static void subject_set_string_free_user_data_event_cb(lv_event_t * e)
 
 static void set_bool_observer(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * obj = (lv_obj_t *)observer->target;
+    lv_obj_t * obj = (lv_obj_t *)observer->obj;
     lv_obj_set_bool_t set_bool_cb = (lv_obj_set_bool_t)observer->user_cb;
     if(set_bool_cb == NULL) return;
 
@@ -3050,7 +3053,7 @@ static void set_bool_observer(lv_observer_t * observer, lv_subject_t * subject)
 
 static void set_int_observer(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * obj = (lv_obj_t *)observer->target;
+    lv_obj_t * obj = (lv_obj_t *)observer->obj;
     lv_obj_set_int_t set_int_cb = (lv_obj_set_int_t)observer->user_cb;
     if(set_int_cb == NULL) return;
 
@@ -3069,7 +3072,7 @@ static void set_int_observer(lv_observer_t * observer, lv_subject_t * subject)
 #if LV_USE_FLOAT
 static void set_float_observer(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * obj = (lv_obj_t *)observer->target;
+    lv_obj_t * obj = (lv_obj_t *)observer->obj;
     lv_obj_set_float_t set_float_cb = (lv_obj_set_float_t)observer->user_cb;
     if(set_float_cb == NULL) return;
 
@@ -3088,7 +3091,7 @@ static void set_float_observer(lv_observer_t * observer, lv_subject_t * subject)
 
 static void set_string_observer(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * obj = (lv_obj_t *)observer->target;
+    lv_obj_t * obj = (lv_obj_t *)observer->obj;
     lv_obj_set_string_t set_string_cb = (lv_obj_set_string_t)observer->user_cb;
     if(set_string_cb == NULL) return;
 
@@ -3107,7 +3110,7 @@ static void set_string_observer(lv_observer_t * observer, lv_subject_t * subject
 
 static void set_color_observer(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * obj = (lv_obj_t *)observer->target;
+    lv_obj_t * obj = (lv_obj_t *)observer->obj;
     lv_obj_set_color_t set_color_cb = (lv_obj_set_color_t)observer->user_cb;
     if(set_color_cb == NULL) return;
 
@@ -3273,7 +3276,7 @@ static void set_style_opa_observer(lv_observer_t * observer, lv_subject_t * subj
 
 static void set_pointer_observer(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * obj = (lv_obj_t *)observer->target;
+    lv_obj_t * obj = (lv_obj_t *)observer->obj;
     lv_obj_set_pointer_t set_pointer_cb = (lv_obj_set_pointer_t)observer->user_cb;
     if(set_pointer_cb == NULL) return;
 

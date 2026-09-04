@@ -86,7 +86,7 @@ static void restart_btn_click_event_cb(lv_event_t * e)
 
 static void fw_update_win_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
-    lv_obj_t * win = (lv_obj_t *) lv_observer_get_target(observer);
+    lv_obj_t * win = lv_observer_get_target_obj(observer);
     lv_obj_t * cont = lv_win_get_content(win);
     lv_fw_update_state_t status = (lv_fw_update_state_t) lv_subject_get_int(fw_update_status_subject);
     if(status == FW_UPDATE_STATE_IDLE) {

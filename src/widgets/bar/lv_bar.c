@@ -812,7 +812,7 @@ static void lv_bar_init_anim(lv_obj_t * obj, lv_bar_anim_t * bar_anim)
 static void bar_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT);
     lv_obj_t * obj = lv_observer_get_target_obj(observer);
@@ -821,11 +821,11 @@ static void bar_value_observer_cb(lv_observer_t * observer, lv_subject_t * subje
     /*If the bar is not rendered yet show the new state immediately*/
     lv_anim_enable_t anim_on = obj->rendered ? LV_ANIM_ON : LV_ANIM_OFF;
     if(subject->type == LV_SUBJECT_TYPE_INT) {
-        lv_bar_set_value(observer->target, subject->value.num, anim_on);
+        lv_bar_set_value(lv_observer_get_target_obj(observer), subject->value.num, anim_on);
     }
 #if LV_USE_FLOAT
     else {
-        lv_bar_set_value(observer->target, (int32_t)subject->value.float_v, anim_on);
+        lv_bar_set_value(lv_observer_get_target_obj(observer), (int32_t)subject->value.float_v, anim_on);
     }
 #endif
 }

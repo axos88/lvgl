@@ -1215,15 +1215,15 @@ static void arc_value_changed_event_cb(lv_event_t * e)
 static void arc_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     LV_ASSERT(observer != NULL);
-    LV_ASSERT(observer->target != NULL);
+    LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT);
     if(subject->type == LV_SUBJECT_TYPE_INT) {
-        lv_arc_set_value(observer->target, subject->value.num);
+        lv_arc_set_value(lv_observer_get_target_obj(observer), subject->value.num);
     }
 #if LV_USE_FLOAT
     else {
-        lv_arc_set_value(observer->target, (int32_t)subject->value.float_v);
+        lv_arc_set_value(lv_observer_get_target_obj(observer), (int32_t)subject->value.float_v);
     }
 #endif
 }

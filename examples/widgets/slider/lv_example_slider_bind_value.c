@@ -9,12 +9,30 @@
  * @title Slider bind value
  * @brief Two-way bind a slider to a shared int subject; a label mirrors the live value.
  *
- * `subject_value` lives in `examples/xml_project/globals.xml` (range 0..100, default 50).
+ * `subject_value` lives in `examples/xml_project/globals.xml` (default 50).
  * The slider's `bind_value` reads and writes the subject: dragging it pushes the new
  * value out so anything else bound to `subject_value` (here, the label) updates
  * immediately. `bind_text-fmt` lets a label render a numeric subject through a
  * printf-style format.
+ *
+ * A subject has no built-in range, so `clamp_0_100` keeps the value in 0..100 no matter
+ * who writes it. A mapper owns the subject's value: it is given the value that was just
+ * written and returns whether it changed the stored one.
  */
+
+/* Keeps `subject_value` in 0..100. `value` holds the previously stored value on entry,
+ * so keeping a copy of it is all that is needed to report whether anything changed.
+ * `input` arrives as a union because a subject's input type need not be the type of its
+ * value; here both are integers, so read `.num`. */
+static bool clamp_0_100(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    int32_t before = *value;
+    *value = lv_subject_clamp_int(input.num, 0, 100);
+    return *value != before;
+}
+
 void lv_example_slider_bind_value(void)
 {
     static lv_subject_t * subject_value;
@@ -23,8 +41,8 @@ void lv_example_slider_bind_value(void)
 
     if(!inited) {
         subject_value = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        lv_subject_set_min_value_int(subject_value, 0);
-        lv_subject_set_max_value_int(subject_value, 100);
+        /* Before the first value, so that one is clamped too. */
+        lv_subject_set_int_mapper(subject_value, clamp_0_100, NULL);
         lv_subject_set_int(subject_value, 50);
         inited = true;
     }

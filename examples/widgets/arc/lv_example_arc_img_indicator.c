@@ -43,8 +43,6 @@ void lv_example_arc_img_indicator(void)
         lv_style_set_opa(&style_arc_knob, 0);
 
         subject_value2 = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        lv_subject_set_min_value_int(subject_value2, 0);
-        lv_subject_set_max_value_int(subject_value2, 100);
         lv_subject_set_int(subject_value2, 20);
         inited = true;
     }

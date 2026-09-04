@@ -12,6 +12,5 @@ SUBJECT_TYPE_NAMES = {
     3: "FLOAT",
     4: "POINTER",
     5: "COLOR",
-    6: "GROUP",
     7: "STRING",
 }

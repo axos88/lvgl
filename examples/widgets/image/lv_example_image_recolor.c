@@ -27,8 +27,6 @@ void lv_example_image_recolor(void)
 
     if(!inited) {
         subject_opa = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        lv_subject_set_min_value_int(subject_opa, 0);
-        lv_subject_set_max_value_int(subject_opa, 255);
         lv_subject_set_int(subject_opa, 128);
         inited = true;
     }

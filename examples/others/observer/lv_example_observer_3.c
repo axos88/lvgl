@@ -5,7 +5,6 @@ static lv_subject_t * hour_subject;
 static lv_subject_t * minute_subject;
 static lv_subject_t * format_subject;
 static lv_subject_t * am_pm_subject;
-static lv_subject_t * time_group_array_subject[4];
 const char * hour12_options = "01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12";
 const char * hour24_options =
     "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23";
@@ -15,6 +14,7 @@ const char * minute_options =
 static void set_btn_clicked_event_cb(lv_event_t * e);
 static void close_clicked_event_cb(lv_event_t * e);
 static void hour_roller_options_update(lv_observer_t * observer, lv_subject_t * subject);
+static bool time_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, const void ** value);
 static void time_observer_cb(lv_observer_t * observer, lv_subject_t * subject);
 
 typedef enum {
@@ -22,18 +22,30 @@ typedef enum {
     TIME_FORMAT_24,
 } time_format_t;
 
+/*The value `time_subject` publishes. Every subscriber gets this, already assembled,
+ *rather than a bare "something changed" and four subjects to go and read.*/
+typedef struct {
+    int32_t hour;
+    int32_t minute;
+    time_format_t format;
+    bool pm;
+} datetime_t;
+
 typedef enum {
     TIME_AM,
     TIME_PM,
 } time_am_pm_t;
 
 /**
- * @title Time setting with a group subject
- * @brief Aggregate hour, minute, format, and AM/PM subjects into one group subject.
+ * @title Time setting with an aggregate subject
+ * @brief Aggregate hour, minute, format, and AM/PM subjects into one subject.
  *
- * Four int subjects hold hour, minute, 12/24 format, and AM/PM. They are gathered
- * into `time_subject` via `lv_subject_set_group_list_static` so a single observer can
- * re-render the time label whenever any element changes. A "Set" button creates
+ * Four int subjects hold hour, minute, 12/24 format, and AM/PM. `time_subject` joins
+ * them: its mapper reads all four, which is what makes them its dependencies, and
+ * assembles a `datetime_t`. Subscribers are handed that finished struct, so the
+ * notification means "the time is now this" rather than "something changed, go and
+ * work out what". No subscriber reads the four parts, so no two of them can disagree
+ * about how to interpret them. A "Set" button creates
  * a bottom container with two rollers and two dropdowns bound through
  * `lv_roller_bind_value` and `lv_dropdown_bind_value`; the AM/PM dropdown adds an
  * observer with `lv_subject_add_observer_obj` to disable itself in
@@ -50,18 +62,20 @@ void lv_example_observer_3(void)
     minute_subject = lv_subject_create(LV_SUBJECT_TYPE_INT);
     format_subject = lv_subject_create(LV_SUBJECT_TYPE_INT);
     am_pm_subject = lv_subject_create(LV_SUBJECT_TYPE_INT);
-    lv_subject_t * time_subject = lv_subject_create(LV_SUBJECT_TYPE_GROUP);
 
     lv_subject_set_int(hour_subject, 7);
     lv_subject_set_int(minute_subject, 45);
     lv_subject_set_int(format_subject, TIME_FORMAT_12);
     lv_subject_set_int(am_pm_subject, TIME_AM);
 
-    time_group_array_subject[0] = hour_subject;
-    time_group_array_subject[1] = minute_subject;
-    time_group_array_subject[2] = format_subject;
-    time_group_array_subject[3] = am_pm_subject;
-    lv_subject_set_group_list_static(time_subject, time_group_array_subject, 4);
+    /*A subject that joins the four above into one value. Its mapper reads them, which
+     *is what registers them as its dependencies, and then assembles a `datetime_t`.
+     *Subscribers receive that struct, so none of them has to know that the time is
+     *stored as four separate subjects, and none of them can disagree about how to
+     *read it.*/
+    static datetime_t datetime;
+    lv_subject_t * time_subject = lv_subject_create(LV_SUBJECT_TYPE_POINTER);
+    lv_subject_set_pointer_mapper(time_subject, time_mapper, &datetime);
 
     /*Create the UI*/
     lv_obj_t * time_label = lv_label_create(lv_screen_active());
@@ -140,21 +154,51 @@ static void close_clicked_event_cb(lv_event_t * e)
     lv_obj_delete(cont);
 }
 
-/*Watch all related subject to display the current time correctly*/
+/*Read every subject the time is made of, and join them into one `datetime_t`.
+ *
+ *This is what the construct is for. It does more than register the four dependencies:
+ *it turns them into a single value with a single meaning. The signal a subscriber gets
+ *is not "something changed, go and work out what the time is now", it is "the time is
+ *now this" with the value attached. Two subscribers cannot drift in how they read it,
+ *because neither of them reads the parts at all.
+ *
+ *The struct lives in the mapper's captured state (`user_data`), so the mapper stays
+ *reusable and the example needs no allocation.*/
+static bool time_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, const void ** value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(input);
+
+    datetime_t * datetime = user_data;
+
+    datetime_t next;
+    next.hour = lv_subject_get_int(hour_subject);
+    next.minute = lv_subject_get_int(minute_subject);
+    next.format = (time_format_t)lv_subject_get_int(format_subject);
+    next.pm = lv_subject_get_int(am_pm_subject) == TIME_PM;
+
+    /*Publishing the same pointer every time, so compare the contents to decide
+     *whether this is really a change.*/
+    if(*value != NULL && lv_memcmp(datetime, &next, sizeof(next)) == 0) return false;
+
+    *datetime = next;
+    *value = datetime;
+    return true;
+}
+
+/*The observer just uses the value it was handed. It does not know, and does not need to
+ *know, that the time is kept as four separate subjects.*/
 static void time_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
-    int32_t hour = lv_subject_get_int(lv_subject_get_group_element(subject, 0));
-    int32_t minute = lv_subject_get_int(lv_subject_get_group_element(subject, 1));
-    int32_t format = lv_subject_get_int(lv_subject_get_group_element(subject, 2));
-    int32_t am_pm = lv_subject_get_int(lv_subject_get_group_element(subject, 3));
-
+    const datetime_t * datetime = lv_subject_get_pointer(subject);
     lv_obj_t * label = (lv_obj_t *) lv_observer_get_target(observer);
 
-    if(format == TIME_FORMAT_24) {
-        lv_label_set_text_fmt(label, "%" LV_PRId32 ":%02" LV_PRId32, hour, minute);
+    if(datetime->format == TIME_FORMAT_24) {
+        lv_label_set_text_fmt(label, "%" LV_PRId32 ":%02" LV_PRId32, datetime->hour, datetime->minute);
     }
     else {
-        lv_label_set_text_fmt(label, "%" LV_PRId32":%02" LV_PRId32" %s", hour + 1, minute, am_pm == TIME_AM ? "am" : "pm");
+        lv_label_set_text_fmt(label, "%" LV_PRId32 ":%02" LV_PRId32 " %s",
+                              datetime->hour + 1, datetime->minute, datetime->pm ? "pm" : "am");
     }
 }
 

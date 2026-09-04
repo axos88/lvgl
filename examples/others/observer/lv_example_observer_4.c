@@ -84,7 +84,9 @@ static void anim_set_x_cb(void * obj, int32_t v)
 
 static void cont_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
-    int32_t prev_v = lv_subject_get_previous_int(subject);
+    /*A subject no longer keeps its previous value, so an observer that needs one
+     *remembers it itself. Only this observer cares about the direction of the change.*/
+    static int32_t prev_v = 0;
     int32_t cur_v = lv_subject_get_int(subject);
     lv_obj_t * cont = (lv_obj_t *) lv_observer_get_target(observer);
 
@@ -114,6 +116,8 @@ static void cont_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
         lv_obj_fade_out(child, 200, delay);
         delay += 50;
     }
+
+    prev_v = cur_v;
 
     /*Create the widgets according to the current value*/
     if(cur_v == 0) {
@@ -180,14 +184,15 @@ static void btn_click_event_cb(lv_event_t * e)
 
 static void btn_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
-    int32_t prev_v = lv_subject_get_previous_int(subject);
     int32_t cur_v = lv_subject_get_int(subject);
 
     lv_obj_t * btn = (lv_obj_t *) lv_observer_get_target(observer);
     int32_t idx = (int32_t)lv_obj_get_index(btn);
 
-    if(idx == prev_v) lv_obj_remove_state(btn, LV_STATE_CHECKED);
+    /*Derive the state from the current value only. This needs no previous value, which
+     *is usually the case once you look for it.*/
     if(idx == cur_v) lv_obj_add_state(btn, LV_STATE_CHECKED);
+    else lv_obj_remove_state(btn, LV_STATE_CHECKED);
 }
 
 static void indicator_observer_cb(lv_observer_t * observer, lv_subject_t * subject)

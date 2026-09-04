@@ -3,6 +3,13 @@ title: How to Use
 description: The lv_observer module is an implementation of the Observer Pattern.
 ---
 
+{/*
+  NOTE: this page is not listed in ../meta.json, so it is not part of the built docs.
+  The live Observer documentation is under main-modules/data_binding/. This file is kept
+  only so its content is not lost; parts of it describe the pre-mapper API and the
+  removed Group Subject type.
+*/}
+
 ## Overview
 
 The `lv_observer` module is an implementation of the Observer Pattern.
@@ -11,14 +18,14 @@ This implementation consists of:
 
 | Field | Description |
 |-------|-------------|
-| `Subjects` | (in global memory or heap) are "logic packages", each containing the value being "observed" and its type (integer (`int32_t`), a string, a pointer, an <ApiLink name="lv_color_t" />, a `float`, or a group); |
+| `Subjects` | (in global memory or heap) are "logic packages", each containing the value being "observed" and its type (integer (`int32_t`), a string, a pointer, an <ApiLink name="lv_color_t" />, a `float`, or nothing at all); |
 | `Observers` | (zero or more per Subject, always dynamically-allocated) are always attached to exactly one Subject, and provide user-defined notifications each the time Subject's value changes. |
 
 A Subject and its Observers can be used in various ways:
 
 1. Simply subscribe to a Subject and get notified when the Subject's value changes.
-2. Subscribe to a group Subject (connects a group of Subjects) to get notified when
-    any of the Subjects' values change in the group.
+2. Subscribe to an aggregate Subject (one whose mapper reads several other Subjects)
+    to get notified when any of those Subjects' values change.
 3. Bind Widgets to Subjects to automatically match the Widget's value with the
     Subject (e.g. a Label's text or an Arc's value).
 
@@ -97,19 +104,18 @@ valid through the life of the Subject.
 | `String` | `LV_SUBJECT_TYPE_STRING` |
 | `Pointer` | `LV_SUBJECT_TYPE_POINTER` |
 | `Color` | `LV_SUBJECT_TYPE_COLOR` |
-| `Group` | `LV_SUBJECT_TYPE_GROUP` |
+| `None` (aggregates other Subjects) | `LV_SUBJECT_TYPE_NONE` |
 
 A new Subject starts from a neutral value (`0`, `NULL`, black, an empty string, an
-empty group), so set the initial value with the matching `lv_subject_set_...()`
+no value for `LV_SUBJECT_TYPE_NONE`), so set the initial value with the matching `lv_subject_set_...()`
 function afterwards. Two types need one extra call before they can hold a value:
 
 | Type | Extra setup |
 |------|-------------|
-| `String` | void <ApiLink name="lv_subject_set_string_buffer_static" display="lv_subject_set_string_buffer_static(subject, buf, prev_buf, buf_size)" /> |
-| `Group` | void <ApiLink name="lv_subject_set_group_list_static" display="lv_subject_set_group_list_static(subject, subject_list[], count)" /> |
+| `String` | void <ApiLink name="lv_subject_set_string_buffer_static" display="lv_subject_set_string_buffer_static(subject, buf, buf_size)" /> |
+| `None` | void <ApiLink name="lv_subject_set_none_mapper" display="lv_subject_set_none_mapper(subject, mapper)" /> |
 
-Both the string buffers and the group list are used in place, not copied, so they
-must out-live the Subject.
+The string buffers are used in place, not copied, so they must out-live the Subject.
 
 A Subject is freed with <ApiLink name="lv_subject_delete" display="lv_subject_delete(subject)" />.
 Subjects still alive when <ApiLink name="lv_deinit" display="lv_deinit()" /> is
@@ -136,38 +142,31 @@ a notification is sent to all current Observers.
 
 ##### Getting a Subject's Value
 
-The following functions are used to get a Subject's current value:
-
-| Field | Description |
-|-------|-------------|
-| `Integer` | int32_t <ApiLink name="lv_subject_get_int" display="lv_subject_get_int(subject)" /> |
-| `Float` | float <ApiLink name="lv_subject_get_float" display="lv_subject_get_float(subject)" /> |
-| `String` | const char * <ApiLink name="lv_subject_get_string" display="lv_subject_get_string(subject)" /> |
-| `Pointer` | const void * <ApiLink name="lv_subject_get_pointer" display="lv_subject_get_pointer(subject)" /> |
-| `Color` | lv_color_t <ApiLink name="lv_subject_get_color" display="lv_subject_get_color(subject)" /> |
+A Subject does not keep its previous value. A mapper is handed the previous stored
+value, and an Observer that needs one remembers it itself.
 
 ##### Getting a Subject's Previous Value
 
 The following functions are used to get a Subject's previous value:
 
-| Field | Description |
-|-------|-------------|
-| `Integer` | int32_t <ApiLink name="lv_subject_get_previous_int" display="lv_subject_get_previous_int(subject)" /> |
-| `Float` | float <ApiLink name="lv_subject_get_previous_float" display="lv_subject_get_previous_float(subject)" /> |
-| `String` | const char * <ApiLink name="lv_subject_get_previous_string" display="lv_subject_get_previous_string(subject)" /> |
-| `Pointer` | const void * <ApiLink name="lv_subject_get_previous_pointer" display="lv_subject_get_previous_pointer(subject)" /> |
-| `Color` | lv_color_t <ApiLink name="lv_subject_get_previous_color" display="lv_subject_get_previous_color(subject)" /> |
-
 ##### Setting a Range for a Subject
 
-The range of the integer and float subjects can be limited by setting minimum and maximum values:
+A Subject has no built-in range. Attach a clamping mapper with
+<ApiLink name="lv_subject_set_int_mapper" display="lv_subject_set_int_mapper()" />
+(or the float variant) instead:
 
-- <ApiLink name="lv_subject_set_min_value_int" display="lv_subject_set_min_value_int(subject, value)" />
-- <ApiLink name="lv_subject_set_max_value_int" display="lv_subject_set_max_value_int(subject, value)" />
-- <ApiLink name="lv_subject_set_min_value_float" display="lv_subject_set_min_value_float(subject, value)" />
-- <ApiLink name="lv_subject_set_max_value_float" display="lv_subject_set_max_value_float(subject, value)" />
+```c
+static bool clamp_0_100(lv_subject_t * subject, void * user_data, int32_t input, int32_t * value)
+{
+    int32_t before = *value;
+    *value = lv_subject_clamp_int(input, 0, 100);
+    return *value != before;
+}
 
-The default range is the smallest and largest possible values, so there is no limit by default.
+lv_subject_set_int_mapper(subject, clamp_0_100, NULL);
+```
+
+See "Mappers" under Data binding for the full picture.
 
 ### Observer
 
@@ -289,18 +288,26 @@ To display the measured value on a label, 3 things are required:
 When any of these 3 input values change, the label needs to be updated, and it needs
 to know all 3 values to compose its text.
 
-To handle this you can create an array from the pointers of all the Subjects that
-are relied upon, and pass that array to a Subject created with GROUP type.
+To handle this, create a Subject of type `LV_SUBJECT_TYPE_NONE`, which has no value of
+its own, and give it a mapper that reads all three. Reading them is what makes them its
+dependencies.
 
 ```c
-static lv_subject_t * subject_list[3] = {subject_1, subject_2, subject_3};
-subject_all = lv_subject_create(LV_SUBJECT_TYPE_GROUP);
-lv_subject_set_group_list_static(subject_all, subject_list, 3);  /* Last argument is number of elements. */
+static bool all_mapper(lv_subject_t * subject)
+{
+    LV_UNUSED(subject);
+    (void)lv_subject_get_int(subject_1);
+    (void)lv_subject_get_int(subject_2);
+    (void)lv_subject_get_int(subject_3);
+    return true;   /* notify whenever any of them changed */
+}
+
+subject_all = lv_subject_create(LV_SUBJECT_TYPE_NONE);
+lv_subject_set_none_mapper(subject_all, all_mapper);
 ```
 
-Observers are then added to Subject Groups (e.g. `subject_all`) in the usual way.
-When this is done, a change to the value of any of the Subjects in the group triggers
-a notification to all Observers subscribed to the Subject Group (e.g. `subject_all`).
+Observers are then added to `subject_all` in the usual way. A change to any of the
+Subjects its mapper reads triggers a notification to all of its Observers.
 
 As an example, the above scenario with Voltage/Current measurement might look like this:
 
@@ -310,22 +317,18 @@ lv_obj_t * label = lv_label_create(lv_screen_active());
 lv_subject_t * subject_mode;  // Voltage or Current
 lv_subject_t * subject_value; // Measured value
 lv_subject_t * subject_unit;  // The unit
-lv_subject_t * subject_all;   // Subject group that connects the above 3 Subjects
-static lv_subject_t * subject_list[3];  // The elements of the group
+lv_subject_t * subject_all;   // Aggregate that connects the above 3 Subjects
 
 subject_mode = lv_subject_create(LV_SUBJECT_TYPE_INT);
 subject_value = lv_subject_create(LV_SUBJECT_TYPE_INT);
 subject_unit = lv_subject_create(LV_SUBJECT_TYPE_POINTER);
-subject_all = lv_subject_create(LV_SUBJECT_TYPE_GROUP);
+subject_all = lv_subject_create(LV_SUBJECT_TYPE_NONE);
 
 lv_subject_set_int(subject_mode, 0); // Let's say 0 is Voltage, 1 is Current
 lv_subject_set_int(subject_value, 0);
 lv_subject_set_pointer(subject_unit, "V");
 
-subject_list[0] = subject_mode;
-subject_list[1] = subject_value;
-subject_list[2] = subject_unit;
-lv_subject_set_group_list_static(subject_all, subject_list, 3);
+lv_subject_set_none_mapper(subject_all, all_mapper);
 
 lv_subject_add_observer_obj(subject_all, all_observer_cb, label, NULL);
 
@@ -334,9 +337,8 @@ lv_subject_add_observer_obj(subject_all, all_observer_cb, label, NULL);
 static void all_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
     lv_obj_t * label = lv_observer_get_target(observer);
-    lv_subject_t * subject_mode = lv_subject_get_group_element(subject, 0);
-    lv_subject_t * subject_value = lv_subject_get_group_element(subject, 1);
-    lv_subject_t * subject_unit = lv_subject_get_group_element(subject, 2);
+    LV_UNUSED(subject);
+    /* Read the source Subjects directly. */
 
     int32_t mode = lv_subject_get_int(subject_mode);
     int32_t value = lv_subject_get_int(subject_value);
@@ -452,8 +454,8 @@ For example:
 <ApiLink name="lv_obj_add_subject_increment_event" display="lv_obj_add_subject_increment_event(button1, subject1, LV_EVENT_CLICKED, 5)" />
 
 This will increment `subject1` by 5 when `button1` is clicked, stopping at the limits
-set by the min/max values of the event or <ApiLink name="lv_subject_set_min_value_int" />
-and <ApiLink name="lv_subject_set_max_value_int" /> (same for float subjects).
+set by the min/max values of the event. A clamping mapper on the subject, if it has
+one, applies on top of whatever the event writes.
 
 ##### Set to a Value
 

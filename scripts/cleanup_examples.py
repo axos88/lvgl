@@ -470,8 +470,7 @@ def map_xml_comments(source: str, path: Path) -> str:
 
 
 def _load_globals_subjects() -> dict[str, dict]:
-    """Return a mapping `name -> {type, value, min_value, max_value}` from
-    `globals.xml`.
+    """Return a mapping `name -> {type, value}` from `globals.xml`.
 
     Cached on first call. Subjects keep their declaration order (Python 3.7+
     dict preserves insertion order), which we lean on when emitting init
@@ -498,8 +497,6 @@ def _load_globals_subjects() -> dict[str, dict]:
                 subjects[name] = {
                     "type": child.tag,  # "int", "string", "float"
                     "value": child.get("value", "0"),
-                    "min_value": child.get("min_value"),
-                    "max_value": child.get("max_value"),
                 }
 
     _load_globals_subjects._cache = subjects  # type: ignore[attr-defined]
@@ -526,14 +523,6 @@ def _subject_init_lines(name: str, meta: dict) -> list[str]:
     out: list[str] = []
     if typ == "int":
         out.append(f"        lv_subject_init_int(&{name}, {value});")
-        if meta.get("min_value") is not None:
-            out.append(
-                f"        lv_subject_set_min_value_int(&{name}, {meta['min_value']});"
-            )
-        if meta.get("max_value") is not None:
-            out.append(
-                f"        lv_subject_set_max_value_int(&{name}, {meta['max_value']});"
-            )
     elif typ == "float":
         out.append(f"        lv_subject_init_float(&{name}, {value});")
     elif typ == "string":

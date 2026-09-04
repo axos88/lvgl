@@ -35,9 +35,14 @@ struct _lv_observer_t {
     void * target;                      /**< A target for the observer, e.g. a widget or any pointer */
     void * user_data;                   /**< Additional parameter, can be used freely by user */
     void (*user_cb)(void);              /**< Additional function pointer, can be used freely by user */
+    lv_observer_mapper_t mapper;        /**< Maps the subject's value to what is pushed to `target` */
+    lv_subject_value_t out;             /**< Last value the mapper produced */
+    lv_style_selector_t style_selector; /**< Part and state, for a style binding */
     uint32_t auto_free_user_data : 1;   /**< Automatically free user data when observer is removed */
     uint32_t notified : 1;              /**< Was observer already notified? */
     uint32_t for_obj : 1;               /**< Is `target` a pointer to a Widget (`lv_obj_t *`)? */
+    uint32_t mode : 1;                  /**< One of the LV_OBSERVER_MODE_... values */
+    uint32_t has_mapper : 1;            /**< Is `mapper` set? */
 };
 
 /**
@@ -58,6 +63,13 @@ struct _lv_subject_increment_dsc_t {
 /*TODO: v10 rename to plain init/deinit after removing old init/deinit functions*/
 void lv_subject_global_init(void);
 void lv_subject_global_deinit(void);
+
+/**
+ * Register `subject` as a dependency of the Subject currently being evaluated, if any.
+ * Called by every `lv_subject_get_...()` to wire dependencies automatically.
+ * @param subject   the Subject that was just read
+ */
+void lv_subject_track_dependency(lv_subject_t * subject);
 
 /**********************
  *      MACROS

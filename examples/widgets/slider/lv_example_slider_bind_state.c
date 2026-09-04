@@ -26,8 +26,6 @@ void lv_example_slider_bind_state(void)
 
     if(!inited) {
         subject_value = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        lv_subject_set_min_value_int(subject_value, 0);
-        lv_subject_set_max_value_int(subject_value, 100);
         lv_subject_set_int(subject_value, 50);
         inited = true;
     }

@@ -32,6 +32,12 @@ void lv_example_observer_4(void);
 void lv_example_observer_5(void);
 void lv_example_observer_6(void);
 void lv_example_observer_7(void);
+void lv_example_observer_8(void);
+void lv_example_observer_9(void);
+void lv_example_observer_10(void);
+void lv_example_observer_11(void);
+void lv_example_observer_12(void);
+void lv_example_observer_13(void);
 
 /**********************
  *      MACROS

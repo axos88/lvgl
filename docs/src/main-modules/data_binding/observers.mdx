@@ -45,6 +45,46 @@ In a generic case any other pointer can be passed as target with
 <ApiLink name="lv_subject_add_observer_with_target" display="lv_subject_add_observer_with_target()" /> and the
 target can be read back with <ApiLink name="lv_observer_get_target" display="lv_observer_get_target()" />.
 
+## Immediate and Batched Observers
+
+An Observer's mode says when it is notified, and it is also what decides whether a lazy
+Subject is dragged into evaluating eagerly. Set it with
+<ApiLink name="lv_observer_set_mode" display="lv_observer_set_mode()" />.
+
+| Mode | When the Observer is notified |
+|------|-------------------------------|
+| `LV_OBSERVER_MODE_IMMEDIATE` (default) | inside the `lv_subject_set_...()` call that changed the value; also makes a lazy Subject act eager |
+| `LV_OBSERVER_MODE_BATCHED` | once per <ApiLink name="lv_subject_flush" display="lv_subject_flush()" />, i.e. once per frame, however many times the value changed |
+
+An eager Subject notifies *all* of its Observers, batched ones included, as soon as it
+evaluates. The mode only controls promotion and, for a Subject that is not eager, when
+the notification is delivered.
+
+Because a Subject defaults to lazy and an Observer defaults to immediate, an ordinary
+`lv_subject_add_observer()` gives the straightforward behavior: writing the Subject
+notifies the Observer right away.
+
+`LV_OBSERVER_MODE_BATCHED` is the equivalent of a scheduled effect. Use it when an
+Observer only needs the latest value and re-running it is not free:
+
+```c
+lv_observer_t * observer = lv_subject_add_observer(samples, refresh_chart_cb, NULL);
+lv_observer_set_mode(observer, LV_OBSERVER_MODE_BATCHED);
+
+lv_subject_set_int(samples, 1);
+lv_subject_set_int(samples, 2);
+lv_subject_set_int(samples, 3);
+/* refresh_chart_cb has not run yet; it runs once at the next flush */
+```
+
+The Subject's *value* is up to date the whole time; only the notification waits. And a
+read does not deliver it, otherwise any reader would break the batching.
+
+<Callout type="info">
+Promotion changes *when* a Subject's mapper runs, not what it is allowed to do. A lazy
+Subject's mapper must stay pure even while an immediate Observer promotes it.
+</Callout>
+
 ## Unsubscribing
 
 An Observer bound to a Widget using <ApiLink name="lv_subject_add_observer_obj" display="lv_subject_add_observer_obj()" /> is removed automatically when that Widget is deleted, so in this case you don't need to do anything. Otherwise:
@@ -105,6 +145,93 @@ lv_obj_bind_checked(checkbox, subject);
 ```
 
 <LvglExample name="lv_example_checkbox_bind_checked" path="widgets/checkbox/lv_example_checkbox_bind_checked" />
+
+### Forwarding to a setter that takes more arguments
+
+The `lv_obj_bind_...()` functions above forward to a setter shaped
+`void (lv_obj_t *, value)`. Plenty of LVGL setters take more: an animation flag, or a
+style selector. There are two ways to bridge that.
+
+For the **style properties**, which is most of them — 129 style setters, all shaped
+`(obj, value, selector)` — there are dedicated binds that carry the selector:
+
+```c
+lv_obj_bind_style_int(box, subject_pad, lv_obj_set_style_pad_all, LV_PART_MAIN);
+lv_obj_bind_style_color(box, subject_col, lv_obj_set_style_bg_color, LV_PART_MAIN);
+lv_obj_bind_style_opa(box, subject_opa, lv_obj_set_style_bg_opa, LV_PART_MAIN);
+```
+
+<ApiLink name="lv_obj_bind_style_opa" display="lv_obj_bind_style_opa()" /> bounds the
+Subject's integer to 0..255, since an opacity is a byte.
+
+For **anything else**, the `LV_SUBJECT_FORWARD_*` macros generate the bridging callback.
+They expand to a `static` function, so put them at file scope:
+
+```c
+LV_SUBJECT_FORWARD_INT(set_slider, lv_slider_set_value, LV_ANIM_OFF)
+
+void my_ui(void)
+{
+    lv_subject_add_observer_obj(subject_value, set_slider, slider, NULL);
+}
+```
+
+There is one per value type: <ApiLink name="LV_SUBJECT_FORWARD_INT" />,
+`LV_SUBJECT_FORWARD_FLOAT`, `LV_SUBJECT_FORWARD_STRING`, `LV_SUBJECT_FORWARD_COLOR` and
+`LV_SUBJECT_FORWARD_POINTER`. The extra arguments come after the value, and at least one
+is required — with none, the plain `lv_obj_bind_...()` already does the job.
+
+The generated function calls the setter directly, so it is fully type-checked and costs
+nothing at run time.
+
+<Callout type="info">
+A setter that already takes exactly `(obj, value)` needs none of this:
+`lv_obj_bind_string(label, subject, lv_label_set_text)` forwards a string Subject to a
+Label directly.
+</Callout>
+
+### Mapping the value on its way out
+
+The `lv_obj_bind_...()` functions above require the Subject's type to match the
+setter's. To bind types that do not match, give the Observer a **mapper** with one of
+the `lv_obj_bind_..._mapped()` functions. The mapper reads the Subject however it likes
+and produces the value to apply, so an integer Subject can set a Label's text directly:
+
+```c
+static bool int_to_text(lv_observer_t * observer, const char ** out)
+{
+    static char buf[32];  /* the mapper owns the storage */
+    lv_subject_t * subject = lv_observer_get_subject(observer);
+    char next[32];
+    lv_snprintf(next, sizeof(next), "%" LV_PRId32 " °C", lv_subject_get_int(subject));
+    if(lv_strcmp(next, buf) == 0) return false;  /* unchanged: leave the Label alone */
+    lv_strlcpy(buf, next, sizeof(buf));
+    *out = buf;
+    return true;
+}
+
+lv_obj_bind_string_mapped(label, temperature, lv_label_set_text, int_to_text);
+```
+
+Like a Subject's mapper it owns change detection: when it returns `false` the Widget
+setter is not called at all.
+
+There is one function per output type:
+<ApiLink name="lv_obj_bind_bool_mapped" />, <ApiLink name="lv_obj_bind_int_mapped" />,
+<ApiLink name="lv_obj_bind_float_mapped" />, <ApiLink name="lv_obj_bind_string_mapped" />,
+<ApiLink name="lv_obj_bind_color_mapped" /> and <ApiLink name="lv_obj_bind_pointer_mapped" />.
+None of them place a type requirement on the Subject.
+
+The mapper is passed at bind time rather than set afterwards, because binding notifies
+the Observer immediately and the mapper has to be in place for that first push.
+
+<Callout type="warning">
+Unlike a Subject's mapper, an Observer's mapper does **not** wire dependencies. An
+Observer is not a node in the dependency graph and runs only when its own Subject
+notifies. Reading other Subjects from an Observer's mapper does not make the Observer
+react to them. To react to several Subjects, derive a Subject or make an
+`LV_SUBJECT_TYPE_NONE` aggregate.
+</Callout>
 
 ### Widget values
 

@@ -5,8 +5,8 @@ description: Learn more about Subjects.
 
 A **Subject** is a value you can observe. When you change it, every
 [Observer](/main-modules/data_binding/observers) attached to it is notified
-automatically. A Subject can hold an integer, a float, a string, a pointer, a
-color, or a group of other Subjects.
+automatically. A Subject can hold an integer, a float, a string, a pointer or a
+color, or nothing at all, in which case it exists only to aggregate other Subjects.
 
 ## Creating a Subject
 
@@ -21,13 +21,13 @@ lv_subject_set_int(temperature, 20);            /* integer, starts at 20 */
 ```
 
 A newly created Subject starts from a neutral value: `0` for int and float, `NULL`
-for pointer, black for color, an empty string for string, and an empty list for
-group. Set the initial value with the matching `lv_subject_set_...()` function, as
-above.
+for pointer, black for color and an empty string for string. Set the initial value with
+the matching `lv_subject_set_...()` function, as above.
 
 The available types are `LV_SUBJECT_TYPE_INT`, `LV_SUBJECT_TYPE_FLOAT` (requires
 <ApiLink name="LV_USE_FLOAT"/>), `LV_SUBJECT_TYPE_STRING`, `LV_SUBJECT_TYPE_POINTER`,
-`LV_SUBJECT_TYPE_COLOR` and `LV_SUBJECT_TYPE_GROUP`.
+`LV_SUBJECT_TYPE_COLOR` and `LV_SUBJECT_TYPE_NONE`. The last one holds no value and is
+used to [aggregate several Subjects](#aggregating-several-subjects).
 
 Strings need a buffer to live in (and an optional second buffer to remember the
 previous value). The buffers are supplied with
@@ -37,9 +37,8 @@ and must out-live the Subject:
 ```c
 static lv_subject_t * title;
 static char buf[32];
-static char prev_buf[32];
 title = lv_subject_create(LV_SUBJECT_TYPE_STRING);
-lv_subject_set_string_buffer_static(title, buf, prev_buf, sizeof(buf));
+lv_subject_set_string_buffer_static(title, buf, sizeof(buf));
 lv_subject_copy_string(title, "Hello");
 ```
 
@@ -58,13 +57,31 @@ Any Subject still alive at <ApiLink name="lv_deinit" display="lv_deinit()" /> is
 deleted automatically, so a Subject that lives for the whole run of the application
 doesn't have to be deleted by hand.
 
+A Subject cannot be deleted while another Subject's mapper reads it: that would leave
+the mapper without an input, so `lv_subject_delete()` warns and does nothing. Delete the
+dependents first, or take the whole derived chain down at once with
+<ApiLink name="lv_subject_delete_cascade" display="lv_subject_delete_cascade()" />,
+which behaves like SQL's `ON DELETE CASCADE`:
+
+```c
+lv_subject_delete(width);           /* refused: `area` reads it */
+lv_subject_delete_cascade(width);   /* deletes `area` too, then `width` */
+```
+
+Subjects still alive when `lv_deinit()` is called are deleted regardless of their
+dependencies, so shutting an application down needs no ordering.
+
 ## Reading and Writing the Value
 
 Write a value with `lv_subject_set_...()` (e.g. <ApiLink name="lv_subject_set_int"/>).
 
-Most value types notify Observers only when the value changes, however
-pointer Subjects notify on every set, group Subjects notify when their members or the group list changes, and strings
-when the previous buffer is also set.
+Most value types notify Observers only when the value changes, however pointer Subjects
+notify on every set, and strings only when the previous buffer is also set.
+
+When a Subject has a [mapper](#mappers) the mapper decides what counts as a change, and
+when the Subject is not evaluating eagerly the notification is deferred to the next
+[flush](#eager-and-lazy-evaluation). The stored value is always up to date immediately
+either way.
 
 Read the current value back with `lv_subject_get_...()` (e.g. <ApiLink name="lv_subject_get_int"/>):
 
@@ -80,60 +97,645 @@ Strings are copied into the Subject's own buffer, so update them with
 lv_subject_copy_string(title, "Settings");
 ```
 
-Every type (except groups) also has a `lv_subject_get_previous_...()` function (e.g.
-<ApiLink name="lv_subject_get_previous_int" />) that returns the value from before the
-last change, which is handy when a callback needs to compare old and new.
+A Subject does not keep its previous value. An Observer that genuinely needs one — to
+animate away what was there before, say — remembers it itself, in a static or in its
+user data. Change detection does not need it: see [Mappers](#mappers).
 
-## Limiting the Range
+## Mappers
 
-Integer and float Subjects can be clamped. Out-of-range values are pulled back in
-before the Observers are notified:
+A Subject can have a **mapper**: one callback that owns the Subject's value. The value
+slot is state, and the mapper is the only thing that writes it. It runs in two
+situations:
+
+- `lv_subject_set_...()` seeds the slot with the value you wrote, then runs the mapper.
+- A dependency changed, so the Subject is re-evaluated. The mapper runs again on
+  whatever the slot already holds.
+
+The mapper's own code decides which role it plays. There is no separate "computed"
+Subject type.
+
+When the mapper runs depends on the Subject's mode: an eager Subject maps inside
+`lv_subject_set_...()`, a lazy one records the input and maps when something reads it.
+Either way a getter never returns a stale value. See
+[Eager and Lazy Evaluation](#eager-and-lazy-evaluation).
+
+A mapper receives four things:
+
+| Parameter | What it is |
+|-----------|------------|
+| `subject` | the Subject being evaluated |
+| `user_data` | the pointer given to the setter, the mapper's captured state |
+| `input` | the value most recently written with `lv_subject_set_...()` |
+| `value` | in/out pointer to the stored value, holding the **previous** one on entry |
+
+The mapper also owns **change detection**: it returns `true` only when it really changed
+the stored value, and the Observers are notified only then. Because `*value` still holds
+the previous value when the mapper starts, keeping a copy of it is all that is needed —
+which is why a Subject stores no history of its own.
+
+<Callout type="warning">
+A mapper must not write any Subject. A write from inside a mapper is ignored and logs a
+warning. Mappers read; side effects belong in an Observer of an
+`LV_SUBJECT_MODE_EAGER` Subject.
+</Callout>
+
+### Transforming what is written
+
+A mapper that *reads* the slot transforms the value on its way in. This is how a
+Subject is given a range:
 
 ```c
-lv_subject_set_min_value_int(temperature, 0);
-lv_subject_set_max_value_int(temperature, 100);
+static bool clamp_0_100(lv_subject_t * subject, void * user_data, int32_t input, int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    int32_t before = *value;                       /* the previous stored value */
+    *value = lv_subject_clamp_int(input, 0, 100);  /* bound what was written */
+    return *value != before;
+}
+
+temperature = lv_subject_create(LV_SUBJECT_TYPE_INT);
+lv_subject_set_int_mapper(temperature, clamp_0_100, NULL);
+lv_subject_set_int(temperature, 500);   /* stores 100 */
 ```
 
-Set the limits before the first value: `lv_subject_set_int()` clamps to them.
+Attach the mapper before the first value, so the first write is mapped too.
 
-## Grouping Several Subjects
+### Deriving a value from other Subjects
 
-Sometimes one thing depends on several values at once. A **group** Subject ties them
-together, so an Observer fires whenever *any* member changes.
-
-The list of members is passed with
-<ApiLink name="lv_subject_set_group_list_static" display="lv_subject_set_group_list_static()" />.
-The array is not copied, so it must out-live the group Subject:
+A mapper that *overwrites* the slot from other Subjects produces a derived value:
 
 ```c
-static lv_subject_t * list[3];
-static lv_subject_t * measurement;
+static bool area_mapper(lv_subject_t * subject, void * user_data, int32_t input, int32_t * value)
+{
+    LV_UNUSED(subject);
+    int32_t next = lv_subject_get_int(width) * lv_subject_get_int(height);
+    if(next == *value) return false;
+    *value = next;
+    return true;
+}
 
-list[0] = mode;
-list[1] = value;
-list[2] = unit;
-
-measurement = lv_subject_create(LV_SUBJECT_TYPE_GROUP);
-lv_subject_set_group_list_static(measurement, list, 3);
+area = lv_subject_create(LV_SUBJECT_TYPE_INT);
+lv_subject_set_int_mapper(area, area_mapper, NULL);
 ```
 
-In the callback, reach the members with
-<ApiLink name="lv_subject_get_group_element" display="lv_subject_get_group_element()" />:
+**Dependencies wire themselves.** Every `lv_subject_get_...()` call made from inside a
+mapper registers the Subject it read as a dependency of the Subject being evaluated.
+Nothing has to be declared, and the list is rebuilt on every run, so a mapper may read
+different Subjects on different runs. Inspect the result with
+<ApiLink name="lv_subject_get_dependency_count" display="lv_subject_get_dependency_count()" />
+and <ApiLink name="lv_subject_get_dependency" display="lv_subject_get_dependency()" />.
+
+Because the limits may be Subjects themselves, a range can be reactive:
+
+```c
+static bool clamp_reactive(lv_subject_t * subject, void * user_data, int32_t input, int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    int32_t before = *value;
+    *value = lv_subject_clamp_int(input, lv_subject_get_int(lower), lv_subject_get_int(upper));
+    return *value != before;
+}
+```
+
+Lowering `upper` below the stored value now pulls that value down with it.
+
+<Callout type="info">
+Writing to a Subject whose mapper ignores the slot has no effect, because the mapper
+overwrites the value that was just written. This is expected, not an error.
+</Callout>
+
+### One mapper, several Subjects
+
+The mapper's `user_data` is its captured state, the equivalent of the variables a
+closure captures. It is how a mapper reaches the Subjects and configuration it needs
+without any of them having to be file-scope globals:
+
+```c
+typedef struct { int32_t min; int32_t max; } range_t;
+
+static bool clamp_mapper(lv_subject_t * subject, void * user_data, int32_t input, int32_t * value)
+{
+    LV_UNUSED(subject);
+    const range_t * range = user_data;
+    int32_t before = *value;
+    *value = lv_subject_clamp_int(input, range->min, range->max);
+    return *value != before;
+}
+
+static const range_t percent = { .min = 0, .max = 100 };
+static const range_t opacity = { .min = 0, .max = 255 };
+
+lv_subject_set_int_mapper(a, clamp_mapper, (void *)&percent);
+lv_subject_set_int_mapper(b, clamp_mapper, (void *)&opacity);
+```
+
+The same pointer is how a mapper carries a **last-known-good copy** of a value, which is
+what lets it detect that a struct was mutated behind an unchanged pointer. See
+[Owning and comparing pointer values](#owning-and-comparing-pointer-values).
+
+### Mapper per type
+
+Each type has its own setter, so no casting is needed:
+
+| Type | Setter | Mapper signature |
+|------|--------|------------------|
+| `Integer` | <ApiLink name="lv_subject_set_int_mapper" /> | `bool (subject, user_data, int32_t input, int32_t * value)` |
+| `Float` | <ApiLink name="lv_subject_set_float_mapper" /> | `bool (subject, user_data, float input, float * value)` |
+| `String` | <ApiLink name="lv_subject_set_string_mapper" /> | `bool (subject, user_data, const char * input, char * buf, size_t size)` |
+| `Pointer` | <ApiLink name="lv_subject_set_pointer_mapper" /> | `bool (subject, user_data, const void * input, const void ** value)` |
+| `Color` | <ApiLink name="lv_subject_set_color_mapper" /> | `bool (subject, user_data, lv_color_t input, lv_color_t * value)` |
+| `None` | <ApiLink name="lv_subject_set_none_mapper" /> | `bool (subject, user_data)` |
+
+A string mapper gets the Subject's buffer instead of a value, because a string Subject
+owns its storage. Set the buffer with `lv_subject_set_string_buffer_static()` first.
+
+Pass `NULL` to remove a mapper. The Subject then becomes an ordinary writable one again.
+
+## Written as One Type, Observed as Another
+
+A Subject's input type does not have to be the type of its value.
+<ApiLink name="lv_subject_create_mapped" display="lv_subject_create_mapped()" /> takes
+both, and the mapper converts:
+
+```c
+/* Written with a temperature, observed as a level */
+lv_subject_t * level = lv_subject_create_mapped(LV_SUBJECT_TYPE_FLOAT, LV_SUBJECT_TYPE_INT);
+lv_subject_set_int_mapper(level, level_mapper, NULL);
+
+static bool level_mapper(lv_subject_t * s, void * ud, lv_subject_value_t input, int32_t * value)
+{
+    LV_UNUSED(s);
+    LV_UNUSED(ud);
+    int32_t next = input.float_v > 80.0f ? LEVEL_CRITICAL :
+                   input.float_v > 60.0f ? LEVEL_HIGH : LEVEL_NORMAL;
+    if(next == *value) return false;
+    *value = next;
+    return true;
+}
+
+lv_subject_set_float(level, 72.5f);     /* written as a float */
+lv_subject_get_int(level);             /* read as LEVEL_HIGH */
+```
+
+The mapper is the one for the **value** type, and `input` carries the written value, so
+you read the union member matching the input type. That is why `input` is an
+`lv_subject_value_t` rather than a typed parameter: one mapper family has to serve every
+input type.
+
+This collapses what would otherwise be two Subjects — a float source and a derived int —
+into one, for the case where the raw form is of no interest to anybody. Keep them
+separate when the raw value is worth observing too.
+
+Note that the Observers only fire when the *level* changes. A temperature moving from
+72.5 to 75.0 is not a change as far as this Subject is concerned, which is usually
+exactly what you want from a threshold.
+
+<Callout type="warning">
+Such a Subject needs a mapper: without one there is nothing to convert with, so a write
+is refused and logs a warning. `lv_subject_get_input_type()` reports the input type, and
+writing any other type is refused as it would be for an ordinary Subject.
+</Callout>
+
+## Eager and Lazy Evaluation
+
+When a Subject with a mapper re-evaluates is set with
+<ApiLink name="lv_subject_set_mode" display="lv_subject_set_mode()" />:
+
+| Mode | The mapper runs | The mapper |
+|------|-----------------|------------|
+| `LV_SUBJECT_MODE_LAZY` (default) | when the value is read, when an eager dependent pulls it, or at the next flush | must be **pure** |
+| `LV_SUBJECT_MODE_EAGER` | inside the `lv_subject_set_...()` call that dirtied it | may have **side effects** |
+
+A lazy Subject records what happened and does the work later. That applies to a write to
+the Subject itself as much as to a dependency changing, so a run of writes collapses into
+a single evaluation:
+
+```c
+lv_subject_set_int(width, 5);
+lv_subject_set_int(width, 6);
+lv_subject_set_int(width, 7);   /* nothing has been mapped yet */
+lv_subject_get_int(width);      /* the mapper runs once, here */
+lv_subject_get_int(area);       /* and `area`'s runs once too */
+```
+
+A lazy Subject that nothing ever reads and nothing observes is never evaluated at all,
+which is the point: work that no one asked for is not done. It also means a lazy mapper
+must be **pure** — it is not defined how many times it runs, or when, and it only ever
+sees the *last* value written. A mapper that accumulates, counts, or must observe every
+value the Subject passes through has to be declared `LV_SUBJECT_MODE_EAGER`.
+
+<Callout type="info">
+Deferral applies to the scalar input types. These always map on the spot whatever their
+mode, because deferring could not be correct:
+
+- one with an immediate Observer, which promotes it anyway;
+- one that [owns its value](#owning-and-comparing-pointer-values), because ownership of
+  an incoming pointer only transfers once the mapper stores it;
+- one whose input is a **pointer or a string**. A string input is not retained, so
+  deferring would lose it. A pointer input is retained, but a mapper that copies data
+  *out* of it — as the clamped Subject does with its bounds — wants that to happen while
+  the write is still on the stack, not at some later moment.
+
+Scalars are where coalescing a run of writes into one evaluation is worth anything
+anyway.
+</Callout>
+
+An eager Subject recomputes immediately, which makes it the right place for a side
+effect such as writing a file or driving hardware.
+
+<Callout type="warning">
+Only an `LV_SUBJECT_MODE_EAGER` Subject's mapper may have side effects. A lazy
+Subject's mapper must be pure: it is not defined how many times it runs, or when.
+</Callout>
+
+Evaluation is glitch-free. A write first marks the whole dependent graph dirty, then
+evaluates the eager Subjects, whose mappers pull their dependencies. If `b` and `c`
+both derive from `a`, and `d` derives from `b` and `c`, then writing `a` evaluates `d`
+exactly once, and `d` never sees a fresh `b` next to a stale `c`.
+
+Anything left pending is evaluated and notified by
+<ApiLink name="lv_subject_flush" display="lv_subject_flush()" />, which LVGL calls once
+per `lv_timer_handler()` pass. Call it directly to force pending work to happen at a
+chosen moment, for instance in a unit test that does not run a frame.
+
+A Subject that is dirty, lazy, unobserved and unread is skipped even by a flush.
+Nothing needs its value yet, so it is not computed.
+
+## Owning and Comparing Pointer Values
+
+A pointer Subject notifies on **every** write, and it has to: the pointer may be
+unchanged while the data behind it has been rewritten, and LVGL cannot know. Two
+consequences follow from that, and both have an answer.
+
+### Detecting a mutation behind an unchanged pointer
+
+For a driver that republishes the same buffer every poll, "notify on every write" means
+a notification per poll whether anything moved or not. A mapper fixes it by keeping a
+last-known-good **copy** in its captured state and comparing contents:
+
+```c
+typedef struct { sample_t last_good; bool seeded; } watch_t;
+
+static bool changed_mapper(lv_subject_t * subject, void * user_data, const void * input,
+                           const void ** value)
+{
+    LV_UNUSED(subject);
+    watch_t * w = user_data;
+    const sample_t * now = input;
+    if(now == NULL) return false;
+
+    if(w->seeded && lv_memcmp(&w->last_good, now, sizeof(*now)) == 0) {
+        return false;                 /* same contents: not a change */
+    }
+
+    lv_memcpy(&w->last_good, now, sizeof(*now));
+    w->seeded = true;
+    *value = now;
+    return true;
+}
+
+static watch_t watch;
+lv_subject_set_pointer_mapper(samples, changed_mapper, &watch);
+```
+
+Comparing pointers cannot work here, because the pointer is identical every time. The
+comparison has to be on the contents, so somebody has to keep a copy, and the mapper is
+the right place for it. Because the copy lives in `user_data`, one mapper function
+serves any number of Subjects, each with its own copy.
+
+<LvglExample name="lv_example_observer_10" path="others/observer/lv_example_observer_10" />
+
+### Who keeps the value alive
+
+A pointer Subject stores a bare pointer, so somebody has to answer for the memory behind
+it. **The caller decides, per write.** There are two setters, and the difference between
+them is only who is responsible afterwards.
+
+**Borrowed** — <ApiLink name="lv_subject_set_pointer" display="lv_subject_set_pointer()" />.
+The Subject never releases the data. It has to stay valid until a new value is written,
+or until the Subject is deleted:
+
+```c
+static config_t config;
+lv_subject_set_pointer(cfg, &config);      /* the Subject only borrows it */
+```
+
+**Owned** — <ApiLink name="lv_subject_set_pointer_owned" display="lv_subject_set_pointer_owned()" />.
+Ownership passes to the Subject, which releases the data once it no longer refers to it,
+and releases whatever it still owns when it is deleted. So the caller can allocate and
+forget:
+
+```c
+lv_subject_set_pointer_owned(frame, decode(), lv_free);   /* NULL free_cb means lv_free */
+lv_subject_set_pointer_owned(frame, decode(), lv_free);   /* releases the first */
+lv_subject_delete(frame);                                 /* releases the second */
+```
+
+**Copied** — <ApiLink name="lv_subject_copy_pointer" display="lv_subject_copy_pointer()" />,
+once the Subject has a buffer. The data is copied in, so it only has to be valid for the
+call, and there is no ownership question at all. This is the third way, and usually the
+easiest one to be right about:
+
+```c
+static uint8_t storage[sizeof(sample_t)];
+lv_subject_set_buffer(samples, storage, sizeof(storage), NULL, NULL);
+
+lv_subject_copy_pointer(samples, &sample, sizeof(sample));   /* copies */
+```
+
+Copying also gets **change detection for free**, because the previous bytes are still
+there to compare against. A driver that republishes a mutated buffer notifies only when
+something actually moved — the problem that otherwise needs a
+[mapper with a last-known-good copy](#detecting-a-mutation-behind-an-unchanged-pointer).
+Read the length back with
+<ApiLink name="lv_subject_get_pointer_size" display="lv_subject_get_pointer_size()" />.
+
+The borrowed and owned forms can be mixed freely on the same Subject: each pointer is
+released, or not, according to the write that introduced it. Copying is exclusive,
+though: a Subject either copies or refers.
+<ApiLink name="lv_subject_is_value_owned" display="lv_subject_is_value_owned()" /> reports
+what the stored value currently is.
+
+The release happens **after** the mapper has run, so a mapper may still read the outgoing
+value to decide whether anything changed, and a mapper that keeps the old value — by
+returning `false`, or by storing it again — keeps it alive.
+
+<Callout type="warning">
+Ownership follows what the write handed in. If a mapper stores some *other* pointer — its
+own allocation, say — the Subject treats that as borrowed and never releases it. A mapper
+that publishes its own allocation is responsible for it.
+</Callout>
+
+#### Republishing the same pointer is safe
+
+A driver that mutates its buffer in place and publishes the same pointer again is the
+normal case, and it must not release anything. The Subject only releases a value that a
+*different* one replaced, so this is safe with ownership on:
+
+```c
+buffer->x = 1;
+lv_subject_set_pointer(frame, buffer);   /* stored */
+buffer->x = 2;
+lv_subject_set_pointer(frame, buffer);   /* same pointer: NOT released */
+```
+
+#### The input is retained too
+
+The value and the *input* are two different references, and a Subject keeps both. A
+pointer handed to `lv_subject_set_pointer()` is **retained**, because a mapper does not
+only run on the write: a dependency changing re-runs it, and it is handed the same input
+the last write carried so it can re-derive from it.
+
+That means the same rule applies to the input as to the value: **keep it valid until a
+new input is written, or transfer ownership.** A pointer that dies in between will be
+dereferenced on the next re-evaluation, which may be many frames later.
+
+```c
+/* Wrong: dies before the next re-evaluation */
+{
+    config_t local = { ... };
+    lv_subject_set_pointer(cfg, &local);
+}
+
+/* Right: lives until replaced */
+static config_t held;
+held = ( config_t ){ ... };
+lv_subject_set_pointer(cfg, &held);
+```
+
+With ownership on, the Subject answers for both references, and releases a pointer once
+neither the stored value nor the retained input points at it. So an input that a mapper
+discarded is still released rather than leaked, and republishing the same pointer never
+releases it.
+
+A **string** input is the one exception: `input.pointer` is the written string on a write
+and NULL on a re-evaluation.
+
+Two reasons. `lv_subject_snprintf()` formats into a temporary that it frees before
+returning, so keeping that pointer would leave a dangling one. And it is not needed:
+`lv_subject_copy_string()` copies into the buffer, so a mapper re-deriving on a
+dependency change reads the last value from `buf`.
+
+Note that this is about the *input*, not the value. A string Subject retains its value
+perfectly well — that is what the buffer is for.
+
+```c
+static bool my_string_mapper(lv_subject_t * s, void * ud, lv_subject_value_t input,
+                             char * buf, size_t size)
+{
+    if(input.pointer == NULL) return false;   /* a re-evaluation */
+    ...
+}
+```
+
+#### Strings have the same three forms
+
+A string Subject can copy, borrow or own, exactly as a pointer Subject can.
+
+**Copying** is the usual choice. Give it a buffer and write with
+<ApiLink name="lv_subject_copy_string" display="lv_subject_copy_string()" /> or
+<ApiLink name="lv_subject_snprintf" display="lv_subject_snprintf()" />. The string is
+copied in, so it only has to be valid for the call.
+
+**Borrowing and owning** need no buffer:
+<ApiLink name="lv_subject_set_string" display="lv_subject_set_string()" /> stores a
+`char *` the Subject borrows, and
+<ApiLink name="lv_subject_set_string_owned" display="lv_subject_set_string_owned()" />
+takes ownership of one:
+
+```c
+lv_subject_set_string(title, "Settings");                    /* borrowed literal */
+lv_subject_set_string_owned(title, build_title(), lv_free);  /* owned, freed on replace */
+```
+
+A Subject uses one form or the other. The pointer setters are refused on a Subject that
+has a buffer, and the copying functions need one.
+
+### Fixed and Growable Buffers
+
+<ApiLink name="lv_subject_set_buffer" display="lv_subject_set_buffer()" /> sets up the
+storage a copying Subject uses, and decides whether it can grow:
+
+```c
+/* Fixed: a static array, cannot grow */
+static char buf[32];
+lv_subject_set_buffer(title, buf, sizeof(buf), NULL, NULL);
+
+/* Growable: starts empty and grows as needed */
+lv_subject_set_buffer(title, NULL, 0, my_realloc, my_free);
+```
+
+`realloc_cb` grows the buffer and `free_cb` releases it — when it is replaced by another
+`lv_subject_set_buffer()` call, and when the Subject is deleted. A static buffer passes
+NULL for both, which is what keeps a fixed-footprint, no-allocation project working
+exactly as before.
+
+<Callout type="warning">
+**A write that does not fit is refused, not truncated.** A fixed buffer that is too
+small, or a `realloc_cb` that returns NULL, both mean the write fails: the Subject keeps
+its previous value and no Observer is notified. The copying functions return `false` so
+you can tell.
+
+This is a change from earlier behaviour, which silently clipped a long string to the
+buffer size.
+</Callout>
+
+For text on screen, a shortened label is usually better than no update at all. That is
+what <ApiLink name="lv_subject_copy_string_trimmed" display="lv_subject_copy_string_trimmed()" />
+is for: it grows the buffer if it can, and stores as much as fits if it cannot.
+
+```c
+/* Prefer this for anything the user reads */
+lv_subject_copy_string_trimmed(title, name);
+
+/* Use the strict one when a shortened value would be wrong, not just ugly */
+if(!lv_subject_copy_string(device_id, id)) {
+    /* refuse to publish half an identifier */
+}
+```
+
+Change detection is on the text that was **stored**, so two different long strings that
+trim to the same thing notify once, not twice.
+
+There is no pointer equivalent: half a struct is not a shorter struct, so
+`lv_subject_copy_pointer()` always refuses a write that does not fit.
+
+`lv_subject_snprintf()` measures first, so a growable buffer is grown to fit rather than
+truncating.
+
+## Aggregating Several Subjects
+
+Sometimes one thing depends on several values at once. Create a Subject of type
+`LV_SUBJECT_TYPE_NONE` — one with no value of its own — and give it a mapper that reads
+everything it should react to. Reading them is what makes them its dependencies:
+
+```c
+static bool measurement_mapper(lv_subject_t * subject)
+{
+    LV_UNUSED(subject);
+    (void)lv_subject_get_int(mode);
+    (void)lv_subject_get_int(value);
+    (void)lv_subject_get_pointer(unit);
+    return true;   /* notify whenever any of them changed */
+}
+
+measurement = lv_subject_create(LV_SUBJECT_TYPE_NONE);
+lv_subject_set_none_mapper(measurement, measurement_mapper);
+```
+
+The Observer then reads the sources directly:
 
 ```c
 static void measurement_cb(lv_observer_t * observer, lv_subject_t * subject)
 {
+    LV_UNUSED(subject);
     lv_obj_t * label = lv_observer_get_target(observer);
-    int32_t mode      = lv_subject_get_int(lv_subject_get_group_element(subject, 0));
-    int32_t value     = lv_subject_get_int(lv_subject_get_group_element(subject, 1));
-    const char * unit = lv_subject_get_pointer(lv_subject_get_group_element(subject, 2));
-    lv_label_set_text_fmt(label, "%s: %d %s", mode ? "Current" : "Voltage", value, unit);
+    lv_label_set_text_fmt(label, "%s: %d %s",
+                          lv_subject_get_int(mode) ? "Current" : "Voltage",
+                          lv_subject_get_int(value),
+                          (const char *)lv_subject_get_pointer(unit));
 }
 ```
 
-<Callout type="warn">
-The group subject needs to be deinitialized before any of the subjects it points to.
+An `LV_SUBJECT_TYPE_NONE` Subject is `LV_SUBJECT_MODE_EAGER` by default, so its
+Observers fire as soon as an input changes.
+
+There is no separate member list to keep alive: the members are ordinary dependencies,
+so `lv_subject_delete()` refuses to delete one while the aggregate still reads it, and
+`lv_subject_get_dependency_count()` and `lv_subject_get_dependency()` let you inspect
+them.
+
+Because the notification rule is your mapper, it does not have to be "any change".
+Return a condition to get a threshold or a filter:
+
+```c
+static bool any_alarm(lv_subject_t * subject)
+{
+    LV_UNUSED(subject);
+    return lv_subject_get_int(temperature) > 90 || lv_subject_get_int(pressure) > 200;
+}
+```
+
+<Callout type="info">
+This replaces the `LV_SUBJECT_TYPE_GROUP` type, which was removed. See the
+[v9 to v10 migration guide](/changelog/migration-v10) for a before/after.
 </Callout>
+
+## Ready-made Derived Subjects
+
+Two common shapes come as helpers, so you do not have to write the mapper.
+
+### Running minimum and maximum
+
+<ApiLink name="lv_subject_create_min" display="lv_subject_create_min()" /> and
+<ApiLink name="lv_subject_create_max" display="lv_subject_create_max()" /> create a
+Subject that records the smallest or largest value its source has passed through:
+
+```c
+lv_subject_t * lowest  = lv_subject_create_min(temperature, NULL);
+lv_subject_t * highest = lv_subject_create_max(temperature, NULL);
+
+lv_subject_set_int(temperature, 20);   /* lowest 20, highest 20 */
+lv_subject_set_int(temperature, 25);   /* lowest 20, highest 25 */
+lv_subject_set_int(temperature, 15);   /* lowest 15, highest 25 */
+```
+
+The second argument says how to order two values. Pass `NULL` to use the natural
+ordering, which exists for int, float and color. A pointer Subject has no natural
+ordering, so it needs one:
+
+```c
+static int cheaper(lv_subject_t * subject, lv_subject_value_t a, lv_subject_value_t b)
+{
+    LV_UNUSED(subject);
+    const item_t * ia = a.pointer;
+    const item_t * ib = b.pointer;
+    return (ia->price > ib->price) - (ia->price < ib->price);
+}
+
+lv_subject_t * cheapest = lv_subject_create_min(offered_item, cheaper);
+```
+
+The values arrive as `lv_subject_value_t` because one callback has to serve every
+Subject type; read the member that matches your Subject's type.
+
+These Subjects are eager, so they record every value the source passes through rather
+than only the ones somebody happened to read.
+
+### Bounded mirror
+
+<ApiLink name="lv_subject_create_clamped" display="lv_subject_create_clamped()" />
+creates a Subject that follows its source, bounded to a range. It takes the bounds and a
+compare callback, so it works for any orderable type, not just numbers:
+
+```c
+lv_subject_value_t lo = { .num = 0 };
+lv_subject_value_t hi = { .num = 100 };
+lv_subject_t * bounded = lv_subject_create_clamped(raw, lo, hi, NULL);
+
+lv_subject_set_int(raw, 150);   /* raw stays 150, bounded reports 100 */
+```
+
+Pass `NULL` for the compare callback to use the natural ordering (int, float, color), or
+one of <ApiLink name="lv_subject_compare_int" />,
+<ApiLink name="lv_subject_compare_float" /> and <ApiLink name="lv_subject_compare_color" />
+explicitly. Any other type needs your own.
+
+<Callout type="warning">
+This bounds a *separate* Subject and leaves the source alone. To bound a Subject **in
+place** — so that a two-way Widget binding round-trips through clamped values — give
+that Subject a clamping mapper instead, as shown under
+[Transforming what is written](#transforming-what-is-written).
+</Callout>
+
+For writing your own clamping mapper, <ApiLink name="lv_subject_clamp_int" /> and
+<ApiLink name="lv_subject_clamp_float" /> save spelling out the bounds check.
+
+Both kinds of helper own the returned Subject's user data, so do not call
+`lv_subject_set_user_data()` on it. They are ordinary dependents of their source, so
+the source cannot be deleted while they are alive.
 
 ## Changing a Subject from the UI
 

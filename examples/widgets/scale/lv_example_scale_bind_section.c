@@ -42,13 +42,9 @@ void lv_example_scale_bind_section(void)
         lv_style_set_text_color(&style_section_indicator, lv_color_hex(0xef4444));
 
         subject_value = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        lv_subject_set_min_value_int(subject_value, 0);
-        lv_subject_set_max_value_int(subject_value, 100);
         lv_subject_set_int(subject_value, 50);
 
         subject_value2 = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        lv_subject_set_min_value_int(subject_value2, 0);
-        lv_subject_set_max_value_int(subject_value2, 100);
         lv_subject_set_int(subject_value2, 20);
         inited = true;
     }

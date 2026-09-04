@@ -124,6 +124,9 @@ typedef struct _lv_global_t {
 
 #if LV_USE_OBSERVER
     lv_ll_t subject_ll;
+    lv_subject_t * subject_evaluating;      /**< Subject whose mapper is running, for dependency autowiring */
+    lv_timer_t * subject_flush_timer;       /**< Evaluates dirty lazy Subjects once per lv_timer_handler() pass */
+    uint32_t subject_flushing : 1;          /**< Guard so a nested set() does not start a second drain */
 #endif
 
 #if defined(LV_DRAW_SW_SHADOW_CACHE_SIZE) && LV_DRAW_SW_SHADOW_CACHE_SIZE > 0

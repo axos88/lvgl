@@ -18,16 +18,12 @@ void lv_example_label_bind_text(void)
 {
     static lv_subject_t * subject_text;
     static char subject_text_buf[256];
-    static char subject_text_prev_buf[256];
 
     static bool inited = false;
 
     if(!inited) {
         subject_text = lv_subject_create(LV_SUBJECT_TYPE_STRING);
-        lv_subject_set_string_buffer_static(subject_text,
-                                            subject_text_buf,
-                                            subject_text_prev_buf,
-                                            256);
+        lv_subject_set_string_buffer_static(subject_text, subject_text_buf, 256);
         lv_subject_copy_string(subject_text, "Hello");
         inited = true;
     }

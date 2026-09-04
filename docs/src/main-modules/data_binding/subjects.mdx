@@ -167,6 +167,21 @@ warning. Mappers read; side effects belong in an Observer of an
 `LV_SUBJECT_MODE_EAGER` Subject.
 </Callout>
 
+<Callout type="warning">
+**A mapper may write only its own output** — `*value`, or its own buffer in copy mode. It
+must never write *through* a pointer it reads, including `input`.
+
+Several consumers are handed the same value, so a mutation changes what the others see.
+Whether a sibling notices it within the same update depends on the order things are
+evaluated in, and the corrupted value outlives that update: anything reading the source
+afterwards gets the mutation rather than what was published. This applies to a Subject's
+mapper writing through a dependency exactly as it does to an Observer's mapper — it is
+not an Observer-only rule.
+
+Writing into the Subject's *own* buffer in copy mode is fine, because that buffer belongs
+to the Subject.
+</Callout>
+
 ### Transforming what is written
 
 A mapper that *reads* the slot transforms the value on its way in. This is how a

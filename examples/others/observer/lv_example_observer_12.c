@@ -4,9 +4,9 @@
 /*One subject: the measured temperature, in whole degrees Celsius*/
 static lv_subject_t * subject_temperature;
 
-static bool celsius_text(lv_observer_t * observer, const char ** out);
-static bool to_arc_celsius(lv_observer_t * observer, int32_t * out);
-static bool to_arc_fahrenheit(lv_observer_t * observer, int32_t * out);
+static bool celsius_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out);
+static bool to_arc_celsius(lv_observer_t * observer, lv_subject_value_t input, int32_t * out);
+static bool to_arc_fahrenheit(lv_observer_t * observer, lv_subject_value_t input, int32_t * out);
 
 /**
  * @title Why an observer has a mapper
@@ -74,10 +74,11 @@ void lv_example_observer_12(void)
 }
 
 /*The label's mapper owns the text it hands out, so a static buffer serves.*/
-static bool celsius_text(lv_observer_t * observer, const char ** out)
+static bool celsius_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out)
 {
+    LV_UNUSED(observer);
     static char buf[48];
-    int32_t celsius = lv_subject_get_int(lv_observer_get_subject(observer));
+    int32_t celsius = input.num;
 
     char next[48];
     lv_snprintf(next, sizeof(next), "Temperature is %" LV_PRId32 " Centigrade", celsius);
@@ -90,10 +91,10 @@ static bool celsius_text(lv_observer_t * observer, const char ** out)
 
 /*Bounded to the arc's own range, read from the arc rather than hard-coded, so changing
  *the range in the code above needs no change here.*/
-static bool to_arc_celsius(lv_observer_t * observer, int32_t * out)
+static bool to_arc_celsius(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
     lv_obj_t * arc = lv_observer_get_target_obj(observer);
-    int32_t celsius = lv_subject_get_int(lv_observer_get_subject(observer));
+    int32_t celsius = input.num;
 
     int32_t bounded = lv_subject_clamp_int(celsius, lv_arc_get_min_value(arc), lv_arc_get_max_value(arc));
     if(bounded == *out) return false;   /*nothing to redraw*/
@@ -104,10 +105,10 @@ static bool to_arc_celsius(lv_observer_t * observer, int32_t * out)
 
 /*The same value, converted first. This is the mapper that justifies the whole feature:
  *the subject knows nothing about Fahrenheit, and neither does the arc.*/
-static bool to_arc_fahrenheit(lv_observer_t * observer, int32_t * out)
+static bool to_arc_fahrenheit(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
     lv_obj_t * arc = lv_observer_get_target_obj(observer);
-    int32_t celsius = lv_subject_get_int(lv_observer_get_subject(observer));
+    int32_t celsius = input.num;
     int32_t fahrenheit = (celsius * 9) / 5 + 32;
 
     int32_t bounded = lv_subject_clamp_int(fahrenheit, lv_arc_get_min_value(arc), lv_arc_get_max_value(arc));

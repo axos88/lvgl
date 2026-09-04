@@ -4,7 +4,7 @@
 /*A reading that is free to go outside anything the arc can display*/
 static lv_subject_t * subject_pressure;
 
-static bool clamp_to_arc_range(lv_observer_t * observer, int32_t * out);
+static bool clamp_to_arc_range(lv_observer_t * observer, lv_subject_value_t input, int32_t * out);
 
 /**
  * @title Clamping in the observer, to the target widget's own range
@@ -53,19 +53,16 @@ void lv_example_observer_11(void)
     lv_subject_set_int(subject_pressure, 250);   /*above it: arc shows 100, label 250*/
 }
 
-/*An *observer* mapper, which is shaped differently from a *subject* mapper. It has no
- *`input` parameter: `out` is this observer's own output slot, holding the value it last
- *pushed to the widget, not the subject's value. So the reading has to come from the
- *subject, and `*out` is only there so the mapper can answer "did my output change?" and
- *leave the widget alone when it did not.*/
-static bool clamp_to_arc_range(lv_observer_t * observer, int32_t * out)
+/*An observer mapper gets both halves. `input` is the subject's current value, and `*out`
+ *is this observer's own output slot, holding what it last pushed to the widget. So the
+ *comparison at the end asks "did *my output* change", not "did the subject change" —
+ *which is why a run of out-of-range readings redraws nothing.*/
+static bool clamp_to_arc_range(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
     lv_obj_t * arc = lv_observer_get_target_obj(observer);
-    int32_t reading = lv_subject_get_int(lv_observer_get_subject(observer));
 
-    int32_t bounded = lv_subject_clamp_int(reading, lv_arc_get_min_value(arc), lv_arc_get_max_value(arc));
+    int32_t bounded = lv_subject_clamp_int(input.num, lv_arc_get_min_value(arc), lv_arc_get_max_value(arc));
 
-    /*`*out` is the previous output: same clamped value means nothing to redraw*/
     if(bounded == *out) return false;
 
     *out = bounded;

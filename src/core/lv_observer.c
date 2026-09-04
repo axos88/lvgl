@@ -3042,7 +3042,7 @@ static void set_bool_observer(lv_observer_t * observer, lv_subject_t * subject)
     bool value;
     if(observer->has_mapper) {
         value = observer->out.num != 0;
-        if(!observer->mapper.bool_cb(observer, &value)) return;
+        if(!observer->mapper.bool_cb(observer, subject->value, &value)) return;
         observer->out.num = value ? 1 : 0;
     }
     else {
@@ -3060,7 +3060,7 @@ static void set_int_observer(lv_observer_t * observer, lv_subject_t * subject)
     int32_t value;
     if(observer->has_mapper) {
         value = observer->out.num;
-        if(!observer->mapper.int_cb(observer, &value)) return;
+        if(!observer->mapper.int_cb(observer, subject->value, &value)) return;
         observer->out.num = value;
     }
     else {
@@ -3079,7 +3079,7 @@ static void set_float_observer(lv_observer_t * observer, lv_subject_t * subject)
     float value;
     if(observer->has_mapper) {
         value = observer->out.float_v;
-        if(!observer->mapper.float_cb(observer, &value)) return;
+        if(!observer->mapper.float_cb(observer, subject->value, &value)) return;
         observer->out.float_v = value;
     }
     else {
@@ -3098,7 +3098,7 @@ static void set_string_observer(lv_observer_t * observer, lv_subject_t * subject
     const char * value;
     if(observer->has_mapper) {
         value = observer->out.pointer;
-        if(!observer->mapper.string_cb(observer, &value)) return;
+        if(!observer->mapper.string_cb(observer, subject->value, &value)) return;
         observer->out.pointer = value;  /* the mapper owns the storage, we keep the pointer */
     }
     else {
@@ -3117,7 +3117,7 @@ static void set_color_observer(lv_observer_t * observer, lv_subject_t * subject)
     lv_color_t value;
     if(observer->has_mapper) {
         value = observer->out.color;
-        if(!observer->mapper.color_cb(observer, &value)) return;
+        if(!observer->mapper.color_cb(observer, subject->value, &value)) return;
         observer->out.color = value;
     }
     else {
@@ -3228,7 +3228,7 @@ static void set_style_int_observer(lv_observer_t * observer, lv_subject_t * subj
     int32_t value;
     if(observer->has_mapper) {
         value = observer->out.num;
-        if(!observer->mapper.int_cb(observer, &value)) return;
+        if(!observer->mapper.int_cb(observer, subject->value, &value)) return;
         observer->out.num = value;
     }
     else {
@@ -3245,7 +3245,7 @@ static void set_style_color_observer(lv_observer_t * observer, lv_subject_t * su
     lv_color_t value;
     if(observer->has_mapper) {
         value = observer->out.color;
-        if(!observer->mapper.color_cb(observer, &value)) return;
+        if(!observer->mapper.color_cb(observer, subject->value, &value)) return;
         observer->out.color = value;
     }
     else {
@@ -3262,7 +3262,7 @@ static void set_style_opa_observer(lv_observer_t * observer, lv_subject_t * subj
     int32_t value;
     if(observer->has_mapper) {
         value = observer->out.num;
-        if(!observer->mapper.int_cb(observer, &value)) return;
+        if(!observer->mapper.int_cb(observer, subject->value, &value)) return;
         observer->out.num = value;
     }
     else {
@@ -3283,7 +3283,7 @@ static void set_pointer_observer(lv_observer_t * observer, lv_subject_t * subjec
     const void * value;
     if(observer->has_mapper) {
         value = observer->out.pointer;
-        if(!observer->mapper.pointer_cb(observer, &value)) return;
+        if(!observer->mapper.pointer_cb(observer, subject->value, &value)) return;
         observer->out.pointer = value;
     }
     else {

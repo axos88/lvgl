@@ -7,8 +7,8 @@ static lv_subject_t * subject_adc;
 static lv_subject_t * subject_kelvin;
 
 static bool adc_to_kelvin_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value);
-static bool kelvin_to_celsius_text(lv_observer_t * observer, const char ** out);
-static bool kelvin_to_fahrenheit_text(lv_observer_t * observer, const char ** out);
+static bool kelvin_to_celsius_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out);
+static bool kelvin_to_fahrenheit_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out);
 
 /**
  * @title Mapping a raw sensor value once, then formatting it per subscriber
@@ -75,10 +75,11 @@ static bool adc_to_kelvin_mapper(lv_subject_t * subject, void * user_data, lv_su
     return true;
 }
 
-static bool kelvin_to_celsius_text(lv_observer_t * observer, const char ** out)
+static bool kelvin_to_celsius_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out)
 {
+    LV_UNUSED(observer);
     static char buf[32];
-    int32_t kelvin = lv_subject_get_int(lv_observer_get_subject(observer));
+    int32_t kelvin = input.num;
     int32_t celsius = kelvin - 273;
 
     char next[32];
@@ -91,10 +92,11 @@ static bool kelvin_to_celsius_text(lv_observer_t * observer, const char ** out)
     return true;
 }
 
-static bool kelvin_to_fahrenheit_text(lv_observer_t * observer, const char ** out)
+static bool kelvin_to_fahrenheit_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out)
 {
+    LV_UNUSED(observer);
     static char buf[32];
-    int32_t kelvin = lv_subject_get_int(lv_observer_get_subject(observer));
+    int32_t kelvin = input.num;
     int32_t fahrenheit = ((kelvin - 273) * 9) / 5 + 32;
 
     char next[32];

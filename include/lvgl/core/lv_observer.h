@@ -318,54 +318,61 @@ typedef void (*lv_observer_cb_t)(lv_observer_t * observer, lv_subject_t * subjec
 
 /**
  * Mapper of an Observer that pushes an integer out.
- * Runs when the Observer is notified, before the value reaches its target, so a
- * Subject of any type can drive an integer target.
+ *
+ * Runs when the Observer is notified, before the value reaches its target, so a Subject
+ * of any type can drive an integer target.
+ *
  * @param observer  pointer to Observer
+ * @param input     the Subject's current value. Read the member matching the Subject's
+ *                  type, which need not be the type being pushed out.
  * @param out       in/out pointer to the Observer's **own output slot**, holding the
- *                  value it last pushed to the target. This is not the Subject's value:
- *                  an Observer's mapper has no `input` parameter, so read the observed
- *                  value with `lv_observer_get_subject()` and the matching
- *                  `lv_subject_get_...()`. `*out` is there so the mapper can answer
- *                  "did my output change?".
- * @return          `true` if the mapper changed `*out`. When `false` the target is
- *                  not updated at all.
- * @note            Read the observed value with `lv_observer_get_subject()` and the
- *                  matching `lv_subject_get_...()`. Unlike a Subject's mapper, an
- *                  Observer's mapper does not register dependencies: an Observer is
- *                  not a node in the dependency graph and runs only when its own
- *                  Subject notifies.
+ *                  value it last pushed to the target. Keep a copy of it if you need to
+ *                  know whether your output changed.
+ * @return          `true` if the mapper changed `*out`. When `false` the target is not
+ *                  updated at all.
+ *
+ * @note Unlike a Subject's mapper, an Observer's mapper does not register dependencies:
+ *       an Observer is not a node in the dependency graph and runs only when its own
+ *       Subject notifies. Reach its captured state with `lv_observer_get_user_data()`.
+ * @warning A mapper may write **only** `*out`. It must not write through `input`, or
+ *          through any pointer it reads: the Subject's other Observers are handed the
+ *          same value, so a mutation would change what they see and make the result
+ *          depend on the order they were added in.
  */
-typedef bool (*lv_observer_int_mapper_t)(lv_observer_t * observer, int32_t * out);
+typedef bool (*lv_observer_int_mapper_t)(lv_observer_t * observer, lv_subject_value_t input, int32_t * out);
 
 /**
  * Mapper of an Observer that pushes a boolean out. See @ref lv_observer_int_mapper_t.
  */
-typedef bool (*lv_observer_bool_mapper_t)(lv_observer_t * observer, bool * out);
+typedef bool (*lv_observer_bool_mapper_t)(lv_observer_t * observer, lv_subject_value_t input, bool * out);
 
 #if LV_USE_FLOAT
 /**
  * Mapper of an Observer that pushes a float out. See @ref lv_observer_int_mapper_t.
  */
-typedef bool (*lv_observer_float_mapper_t)(lv_observer_t * observer, float * out);
+typedef bool (*lv_observer_float_mapper_t)(lv_observer_t * observer, lv_subject_value_t input, float * out);
 #endif
 
 /**
  * Mapper of an Observer that pushes a string out. See @ref lv_observer_int_mapper_t.
- * @note `*out` has to point to storage the mapper itself owns, e.g. a static buffer
- *       or one reached through `lv_observer_get_user_data()`. The Observer only keeps
- *       the pointer.
+ * @note `*out` has to point to storage the mapper itself owns, e.g. a static buffer or
+ *       one reached through `lv_observer_get_user_data()`. The Observer only keeps the
+ *       pointer.
  */
-typedef bool (*lv_observer_string_mapper_t)(lv_observer_t * observer, const char ** out);
+typedef bool (*lv_observer_string_mapper_t)(lv_observer_t * observer, lv_subject_value_t input,
+                                            const char ** out);
 
 /**
  * Mapper of an Observer that pushes a color out. See @ref lv_observer_int_mapper_t.
  */
-typedef bool (*lv_observer_color_mapper_t)(lv_observer_t * observer, lv_color_t * out);
+typedef bool (*lv_observer_color_mapper_t)(lv_observer_t * observer, lv_subject_value_t input,
+                                           lv_color_t * out);
 
 /**
  * Mapper of an Observer that pushes a pointer out. See @ref lv_observer_int_mapper_t.
  */
-typedef bool (*lv_observer_pointer_mapper_t)(lv_observer_t * observer, const void ** out);
+typedef bool (*lv_observer_pointer_mapper_t)(lv_observer_t * observer, lv_subject_value_t input,
+                                             const void ** out);
 
 /**
  * An Observer's mapper, selected by the type the Observer pushes out.

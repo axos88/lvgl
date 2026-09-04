@@ -160,6 +160,32 @@ observer, or being declared eager — repositions it first.
   place) or `lv_subject_create_clamped()` (a separate bounded mirror).
 - `prev_value` and the five `lv_subject_get_previous_*()`.
 
+### 1.8b A mapper writes only its own output
+
+An observer's mapper now receives `(observer, input, *out)`, symmetric with a subject's
+mapper: `input` is the subject's current value, `*out` is the observer's own output slot
+holding what it last pushed. Before, an observer mapper had no `input` and had to fetch
+the value through `lv_observer_get_subject()`, which read as though `*out` were the
+input — it was misread exactly that way, which is why it changed.
+
+The rule that comes with it: **a mapper may write only its own output.** Never through
+`input`, never through any pointer it reads. Two tests pin why:
+
+- On the observer side the leak is immediate and ordered. Observers are notified in the
+  order they were added, so a mapper that mutates the value is seen by every observer
+  after it. `test_observer_mapper_mutation_is_seen_by_later_observers` asserts the second
+  observer sees `999` rather than what was published.
+- On the subject side it is the same hazard but the timing differs, and testing it
+  corrected an assumption of mine. Dirty subjects are evaluated from the head of the
+  global list and marking moves them there, so derived subjects run roughly in reverse
+  registration order — the reader happened to run *before* the mutator, and saw the clean
+  value. What is unambiguous, and what the test asserts, is that a consumer corrupted the
+  value its producer published, and that the corruption outlives the update: a lazy
+  dependent read afterwards gets `555`, not the published `1`.
+
+So it is not an observer-only rule. Writing a subject's *own* buffer in copy mode is
+fine, because the buffer belongs to the subject.
+
 ### 1.9 An observer has one pointer for application data
 
 An observer used to carry two general-purpose pointers, `target` and `user_data`, doing
@@ -254,7 +280,7 @@ none.
 - `python3 tests/main.py test --build-options OPTIONS_TEST_DEFHEAP` — 183/183 pass.
 - `python3 tests/main.py build` — every configuration compiles, including
   `OPTIONS_MINIMAL` with `LV_USE_OBSERVER 0`, and the examples.
-- `test_observer.c` covers 181 cases.
+- `test_observer.c` covers 184 cases.
 
 Measured coverage of `src/core/lv_observer.c` (gcov, `OPTIONS_TEST_DEFHEAP`):
 

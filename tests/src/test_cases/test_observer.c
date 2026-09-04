@@ -2275,8 +2275,9 @@ void test_subject_none_mapper_aggregates_with_a_custom_rule(void)
  *====================================================================*/
 
 /* The motivating case: an integer Subject driving a Label's text directly. */
-static bool int_to_text_mapper(lv_observer_t * observer, const char ** out)
+static bool int_to_text_mapper(lv_observer_t * observer, lv_subject_value_t input, const char ** out)
 {
+    LV_UNUSED(input);
     /* The mapper owns the storage; the Observer only keeps the pointer. */
     static char buf[32];
     lv_subject_t * subject = lv_observer_get_subject(observer);
@@ -2316,8 +2317,9 @@ static void counting_set_int(lv_obj_t * obj, int32_t value)
 
 /* Maps any value to a constant, so the mapper reports "unchanged" from the second
  * run on and the target must stop being written. */
-static bool constant_int_mapper(lv_observer_t * observer, int32_t * out)
+static bool constant_int_mapper(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
+    LV_UNUSED(input);
     LV_UNUSED(observer);
     observer_mapper_runs++;
     if(*out == 5) return false;
@@ -2349,8 +2351,9 @@ void test_observer_mapper_returning_false_skips_the_target(void)
 }
 
 /* A string Subject driving a boolean Widget property. */
-static bool string_non_empty_mapper(lv_observer_t * observer, bool * out)
+static bool string_non_empty_mapper(lv_observer_t * observer, lv_subject_value_t input, bool * out)
 {
+    LV_UNUSED(input);
     lv_subject_t * subject = lv_observer_get_subject(observer);
     const char * text = lv_subject_get_string(subject);
     bool next = text != NULL && text[0] != '\0';
@@ -2376,8 +2379,9 @@ void test_observer_mapper_binds_string_subject_to_bool(void)
 
 /* An Observer's mapper must not register dependencies: an Observer is not a node in
  * the dependency graph. */
-static bool dependency_probing_mapper(lv_observer_t * observer, int32_t * out)
+static bool dependency_probing_mapper(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
+    LV_UNUSED(input);
     LV_UNUSED(observer);
     *out = lv_subject_get_int(dep_a) + lv_subject_get_int(dep_b);
     return true;
@@ -4729,8 +4733,9 @@ void test_subject_forward_float_macro(void)
 }
 
 /* An int Subject driving a float setter, through a mapper. */
-static bool int_to_float_mapper(lv_observer_t * observer, float * out)
+static bool int_to_float_mapper(lv_observer_t * observer, lv_subject_value_t input, float * out)
 {
+    LV_UNUSED(input);
     float next = (float)lv_subject_get_int(lv_observer_get_subject(observer)) / 4.0f;
     if(next == *out) return false;
     *out = next;
@@ -4841,8 +4846,9 @@ void test_subject_min_max_and_clamped_on_color(void)
 }
 
 /* An int Subject driving a colour setter through a mapper: a threshold turning red. */
-static bool level_to_color(lv_observer_t * observer, lv_color_t * out)
+static bool level_to_color(lv_observer_t * observer, lv_subject_value_t input, lv_color_t * out)
 {
+    LV_UNUSED(input);
     int32_t v = lv_subject_get_int(lv_observer_get_subject(observer));
     lv_color_t next = v > 50 ? lv_color_hex(0xff0000) : lv_color_hex(0x00ff00);
     if(lv_color_to_u32(next) == lv_color_to_u32(*out)) return false;
@@ -4871,8 +4877,9 @@ void test_observer_bind_color_mapped(void)
 
 static const char * const choice_options[] = { "off", "on" };
 
-static bool int_to_choice(lv_observer_t * observer, const void ** out)
+static bool int_to_choice(lv_observer_t * observer, lv_subject_value_t input, const void ** out)
 {
+    LV_UNUSED(input);
     const void * next = choice_options[lv_subject_get_int(lv_observer_get_subject(observer)) ? 1 : 0];
     if(next == *out) return false;
     *out = next;
@@ -4903,8 +4910,9 @@ void test_observer_bind_pointer_mapped(void)
  *====================================================================*/
 
 /* A float Subject driving an integer style property. */
-static bool tenths_to_pad(lv_observer_t * observer, int32_t * out)
+static bool tenths_to_pad(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
+    LV_UNUSED(input);
     int32_t next = lv_subject_get_int(lv_observer_get_subject(observer)) / 10;
     if(next == *out) return false;
     *out = next;
@@ -4946,8 +4954,9 @@ void test_observer_bind_style_color_mapped(void)
 }
 
 /* Maps a 0..100 percentage onto a 0..255 opacity, and the result is still bounded. */
-static bool percent_to_opa(lv_observer_t * observer, int32_t * out)
+static bool percent_to_opa(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
 {
+    LV_UNUSED(input);
     int32_t next = lv_subject_get_int(lv_observer_get_subject(observer)) * 255 / 100;
     if(next == *out) return false;
     *out = next;
@@ -5407,6 +5416,174 @@ void test_subject_mapper_user_data_owned_needs_a_mapper(void)
     /* No mapper yet, so there is nothing to own: refused rather than silently armed. */
     lv_subject_set_mapper_user_data_owned(v);
     TEST_ASSERT_NULL(lv_subject_get_mapper_user_data(v));
+}
+
+
+/*=====================================================================
+ * A mapper must write only its own output
+ *
+ * Several consumers are handed the same value. If one of them writes through it, the
+ * others see the change, and what they see depends on the order they were added in.
+ * These two tests pin that, because it is the reason for the rule rather than a
+ * behaviour worth relying on.
+ *====================================================================*/
+
+typedef struct {
+    int32_t n;
+} box_t;
+
+static int32_t second_observer_saw;
+
+/* Badly behaved on purpose: it writes through `input`. */
+static bool mutating_observer_mapper(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
+{
+    LV_UNUSED(observer);
+    box_t * b = (box_t *)input.pointer;
+    if(b == NULL) return false;
+    b->n = 999;                  /* the mutation the rule forbids */
+    *out = b->n;
+    return true;
+}
+
+static bool reading_observer_mapper(lv_observer_t * observer, lv_subject_value_t input, int32_t * out)
+{
+    LV_UNUSED(observer);
+    const box_t * b = input.pointer;
+    if(b == NULL) return false;
+    second_observer_saw = b->n;
+    *out = b->n;
+    return true;
+}
+
+static void ignore_int(lv_obj_t * obj, int32_t v)
+{
+    LV_UNUSED(obj);
+    LV_UNUSED(v);
+}
+
+void test_observer_mapper_mutation_is_seen_by_later_observers(void)
+{
+    static box_t box;
+    box.n = 1;
+
+    lv_subject_t * subject = subject_create(LV_SUBJECT_TYPE_POINTER);
+    lv_obj_t * a = lv_obj_create(lv_screen_active());
+    lv_obj_t * b = lv_obj_create(lv_screen_active());
+
+    /* Added first, so notified first. */
+    lv_obj_bind_int_mapped(a, subject, ignore_int, mutating_observer_mapper, NULL);
+    lv_obj_bind_int_mapped(b, subject, ignore_int, reading_observer_mapper, NULL);
+
+    second_observer_saw = 0;
+    lv_subject_set_pointer(subject, &box);
+
+    /* The second Observer saw the first Observer's mutation, not the value that was
+     * published. That is why a mapper may write only `*out`. */
+    TEST_ASSERT_EQUAL(999, second_observer_saw);
+    TEST_ASSERT_EQUAL(999, box.n);
+}
+
+/* The same hazard exists on the Subject side, so it is not an Observer-only rule: two
+ * derived Subjects reading one pointer dependency are in exactly the same position.
+ *
+ * This asserts the *inconsistency* rather than a particular order. Observers are
+ * notified in the order they were added, while dirty Subjects are evaluated from the
+ * head of the global list and marking moves them there, so derived Subjects run in
+ * roughly the reverse order. Pinning either direction would be over-fitting; what
+ * matters is that two consumers of one value disagree about what it was. */
+static lv_subject_t * shared_source;
+static int32_t first_dependent_saw;
+static int32_t second_dependent_saw;
+
+static bool mutating_subject_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
+                                    int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    LV_UNUSED(input);
+    box_t * b = (box_t *)lv_subject_get_pointer(shared_source);
+    if(b == NULL) return false;
+
+    first_dependent_saw = b->n;
+    b->n = 555;                  /* writing through a dependency: also forbidden */
+    *value = b->n;
+    return true;
+}
+
+static bool reading_subject_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
+                                   int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    LV_UNUSED(input);
+    const box_t * b = lv_subject_get_pointer(shared_source);
+    if(b == NULL) return false;
+
+    second_dependent_saw = b->n;
+    *value = b->n;
+    return true;
+}
+
+void test_subject_mapper_mutation_leaks_between_dependents(void)
+{
+    static box_t box;
+    box.n = 1;
+
+    shared_source = subject_create(LV_SUBJECT_TYPE_POINTER);
+
+    lv_subject_t * first = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(first, mutating_subject_mapper, NULL);
+    lv_subject_set_mode(first, LV_SUBJECT_MODE_EAGER);
+
+    lv_subject_t * second = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(second, reading_subject_mapper, NULL);
+    lv_subject_set_mode(second, LV_SUBJECT_MODE_EAGER);
+
+    first_dependent_saw = 0;
+    second_dependent_saw = 0;
+    box.n = 1;
+    lv_subject_set_pointer(shared_source, &box);
+
+    /* A consumer changed the value its producer published. That much is unambiguous. */
+    TEST_ASSERT_EQUAL(555, box.n);
+    TEST_ASSERT_EQUAL(555, ((const box_t *)lv_subject_get_pointer(shared_source))->n);
+
+    /* Whether a *sibling in the same round* sees it depends on evaluation order, which is
+     * precisely why this must not be done. Here the reader happened to run first and saw
+     * the published 1; anything evaluated afterwards sees 555 instead. */
+    TEST_ASSERT_TRUE(first_dependent_saw == 1 || first_dependent_saw == 555);
+
+    /* A lazy dependent added now, and read now, gets the corrupted value rather than
+     * what was published — the leak outlives the round it happened in. */
+    second_dependent_saw = 0;
+    lv_subject_t * late = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(late, reading_subject_mapper, NULL);
+    TEST_ASSERT_EQUAL(555, lv_subject_get_int(late));
+    TEST_ASSERT_EQUAL(555, second_dependent_saw);
+}
+
+/* What a Subject mapper *may* write is its own value, including the buffer in copy mode.
+ * That is not a mutation of anyone else's data. */
+static bool buffer_writing_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
+                                  char * buf, size_t size)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    if(input.pointer == NULL) return false;
+    if(lv_strcmp(buf, "written") == 0) return false;
+    lv_strlcpy(buf, "written", size);
+    return true;
+}
+
+void test_subject_mapper_may_write_its_own_buffer(void)
+{
+    static char buf[16];
+    lv_subject_t * text = subject_create(LV_SUBJECT_TYPE_STRING);
+    lv_subject_set_buffer(text, buf, sizeof(buf), NULL, NULL);
+    lv_subject_set_string_mapper(text, buffer_writing_mapper, NULL);
+
+    lv_subject_copy_string(text, "anything");
+    TEST_ASSERT_EQUAL_STRING("written", lv_subject_get_string(text));
 }
 
 #endif

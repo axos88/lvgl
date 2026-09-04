@@ -216,12 +216,24 @@ lv_obj_bind_string_mapped(label, temperature, lv_label_set_text, int_to_text);
 Like a Subject's mapper it owns change detection: when it returns `false` the Widget
 setter is not called at all.
 
+An Observer's mapper receives both halves, like a Subject's does:
+
+| Parameter | What it is |
+|-----------|------------|
+| `observer` | this Observer; `lv_observer_get_user_data()` reaches its captured state |
+| `input` | the Subject's current value, as `lv_subject_value_t` |
+| `out` | in/out pointer to the Observer's **own output slot**, holding what it last pushed |
+
+So the comparison at the end of a mapper asks "did *my output* change", not "did the
+Subject change" — which is what lets a run of Subject changes that map to the same output
+leave the Widget alone.
+
 <Callout type="warning">
-An Observer's mapper is shaped differently from a Subject's. It has **no `input`
-parameter**, and `out` is the Observer's *own output slot* — the value it last pushed to
-the Widget, not the Subject's value. Read the observed value with
-<ApiLink name="lv_observer_get_subject" display="lv_observer_get_subject()" /> and the
-matching getter; `*out` exists only so the mapper can answer "did my output change?".
+**A mapper may write only `*out`.** It must never write through `input`, or through any
+pointer it reads. The Subject's other Observers are handed the same value, so a mutation
+changes what they see and makes the result depend on the order they were added in. The
+same rule applies to a Subject's mapper writing through a dependency, so it is not an
+Observer-only concern.
 </Callout>
 
 There is one function per output type:

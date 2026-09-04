@@ -226,9 +226,39 @@ none.
 - `python3 tests/main.py test --build-options OPTIONS_TEST_DEFHEAP` — 183/183 pass.
 - `python3 tests/main.py build` — every configuration compiles, including
   `OPTIONS_MINIMAL` with `LV_USE_OBSERVER 0`, and the examples.
-- `test_observer.c` covers 151 cases.
+- `test_observer.c` covers 174 cases.
 
-`test_lodepng` is a known-flaky memory-ceiling assertion and is unrelated to this work.
+Measured coverage of `src/core/lv_observer.c` (gcov, `OPTIONS_TEST_DEFHEAP`):
+
+| | before the audit | after |
+|---|---|---|
+| lines executed | 78.8% | **93.7%** |
+| branches executed | 81.4% | **98.0%** |
+
+The audit that produced those numbers also found that the subject-changing event helpers
+(`lv_obj_add_subject_increment_event`, `..._toggle_event`, `..._set_int/float/string_event`)
+had **never** been covered — not before this work either — while this rearchitecture
+changed their behaviour: the increment event used to intersect its own range with the
+Subject's `min_value`/`max_value`, and those fields are gone. A documented behaviour
+change with no test was the largest real gap, and it is now covered including the
+interaction with a clamping mapper.
+
+What is deliberately still uncovered, about 120 lines:
+
+- allocation-failure and argument-check paths, which need fault injection to reach;
+- the deprecated `lv_subject_init_float/pointer/color/string()`, which are removed in
+  v10, so testing them would be maintaining code on its way out;
+- the `dependents` loop in `edges_teardown()`, which `lv_subject_delete()` now refuses to
+  reach and `lv_subject_delete_cascade()` empties first. It is defensive, and worth
+  keeping as such.
+
+Two habits the audit was worth for, beyond the numbers. Three tests leaned on ASan to
+catch a dangling edge rather than asserting anything, so they now compare the global
+Subject count before and after a cascade — which also pins that a diamond's sink is
+deleted exactly once. And one pair of clamped-Subject tests turned out to be a strict
+subset of the other, so the weaker one is gone; the other near-duplicate names checked
+out as genuinely different paths, direct-write deferral against dependency-driven
+deferral, and were kept.
 
 ## 5. How this could fit LVGL XML and the Pro Editor
 

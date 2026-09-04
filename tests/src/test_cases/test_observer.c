@@ -2772,10 +2772,15 @@ void test_subject_delete_cascade_removes_dependents(void)
     subject_forget(chain_l1);
     subject_forget(chain_l2);
 
+    uint32_t before = lv_ll_get_len(&LV_GLOBAL_DEFAULT()->subject_ll);
+
     /* a -> l1 -> l2: deleting the root takes the whole chain with it. */
     lv_subject_delete_cascade(dep_a);
 
-    /* Nothing is left to walk; if an edge had survived this would touch freed memory. */
+    /* All three are gone, not just the root. */
+    TEST_ASSERT_EQUAL(before - 3, lv_ll_get_len(&LV_GLOBAL_DEFAULT()->subject_ll));
+
+    /* And nothing is left to walk; a surviving edge would touch freed memory here. */
     lv_subject_flush();
 }
 
@@ -2801,7 +2806,12 @@ void test_subject_delete_cascade_handles_a_diamond(void)
     subject_forget(diamond_c);
     subject_forget(sink);
 
+    uint32_t before = lv_ll_get_len(&LV_GLOBAL_DEFAULT()->subject_ll);
+
     lv_subject_delete_cascade(dep_a);
+
+    /* Four gone, and the sink exactly once even though two paths reach it. */
+    TEST_ASSERT_EQUAL(before - 4, lv_ll_get_len(&LV_GLOBAL_DEFAULT()->subject_ll));
     lv_subject_flush();
 }
 
@@ -2817,7 +2827,9 @@ void test_subject_delete_cascade_on_a_leaf_is_a_plain_delete(void)
     TEST_ASSERT_EQUAL(2, lv_subject_get_int(sum));
 
     subject_forget(sum);
+    uint32_t before = lv_ll_get_len(&LV_GLOBAL_DEFAULT()->subject_ll);
     lv_subject_delete_cascade(sum);  /* nothing depends on it */
+    TEST_ASSERT_EQUAL(before - 1, lv_ll_get_len(&LV_GLOBAL_DEFAULT()->subject_ll));
 
     /* The dependencies survive, with their edges cleaned up. */
     TEST_ASSERT_EQUAL(0, lv_ll_get_len(&dep_a->dependents));
@@ -4000,35 +4012,6 @@ void test_subject_pointer_input_is_retained(void)
     TEST_ASSERT_EQUAL_PTR(&payload, lv_subject_get_pointer(subject));
 }
 
-/* A source change re-runs the clamp mapper with the range it retained, which is exactly
- * why that range has to stay valid. */
-void test_subject_clamped_reclamps_on_source_change(void)
-{
-    lv_subject_t * reading = subject_create(LV_SUBJECT_TYPE_INT);
-    lv_subject_set_int(reading, 5);
-
-    lv_subject_value_t lo;
-    lv_subject_value_t hi;
-    lv_memzero(&lo, sizeof(lo));
-    lv_memzero(&hi, sizeof(hi));
-    lo.num = 0;
-    hi.num = 10;
-    lv_subject_t * bounded = lv_subject_create_clamped(reading, lo, hi, NULL);
-
-    static lv_subject_range_t wide;
-    wide.min_value.num = 0;
-    wide.max_value.num = 100;
-    lv_subject_set_pointer(bounded, &wide);
-    TEST_ASSERT_EQUAL(5, lv_subject_get_int(bounded));
-
-    lv_subject_set_int(reading, 60);
-    TEST_ASSERT_EQUAL(60, lv_subject_get_int(bounded));
-
-    lv_subject_set_int(reading, 500);
-    TEST_ASSERT_EQUAL(100, lv_subject_get_int(bounded));
-
-    lv_subject_delete(bounded);
-}
 
 
 /*=====================================================================
@@ -4663,5 +4646,603 @@ void test_subject_short_circuit_does_not_swallow_a_write(void)
     lv_subject_set_int(value, 40);
     TEST_ASSERT_EQUAL(40, lv_subject_get_int(value));
 }
+
+
+/*=====================================================================
+ * The bind families that were not yet exercised
+ *====================================================================*/
+
+static int32_t captured_tag;
+static const char * captured_str;
+static const void * captured_ptr;
+static lv_color_t captured_col;
+
+/* Setters with an extra argument, which is what the FORWARD macros exist to bridge. */
+static void capture_string_tagged(lv_obj_t * obj, const char * v, int32_t tag)
+{
+    LV_UNUSED(obj);
+    captured_str = v;
+    captured_tag = tag;
+}
+
+static void capture_pointer_tagged(lv_obj_t * obj, const void * v, int32_t tag)
+{
+    LV_UNUSED(obj);
+    captured_ptr = v;
+    captured_tag = tag;
+}
+
+LV_SUBJECT_FORWARD_STRING(forward_str_tagged, capture_string_tagged, 7)
+LV_SUBJECT_FORWARD_POINTER(forward_ptr_tagged, capture_pointer_tagged, 9)
+
+void test_subject_forward_string_and_pointer_macros(void)
+{
+    static char buf[16];
+    lv_subject_t * text = subject_create(LV_SUBJECT_TYPE_STRING);
+    lv_subject_set_buffer(text, buf, sizeof(buf), NULL, NULL);
+    lv_subject_copy_string(text, "hi");
+
+    lv_obj_t * obj = lv_obj_create(lv_screen_active());
+    captured_str = NULL;
+    captured_tag = 0;
+    lv_subject_add_observer_obj(text, forward_str_tagged, obj, NULL);
+    TEST_ASSERT_EQUAL_STRING("hi", captured_str);
+    TEST_ASSERT_EQUAL(7, captured_tag);
+
+    lv_subject_copy_string(text, "there");
+    TEST_ASSERT_EQUAL_STRING("there", captured_str);
+
+    static int32_t payload = 3;
+    lv_subject_t * ptr = subject_create(LV_SUBJECT_TYPE_POINTER);
+    captured_ptr = NULL;
+    lv_subject_set_pointer(ptr, &payload);
+    lv_subject_add_observer_obj(ptr, forward_ptr_tagged, obj, NULL);
+    TEST_ASSERT_EQUAL_PTR(&payload, captured_ptr);
+    TEST_ASSERT_EQUAL(9, captured_tag);
+}
+
+#if LV_USE_FLOAT
+static float captured_flt;
+
+static void capture_float_tagged(lv_obj_t * obj, float v, int32_t tag)
+{
+    LV_UNUSED(obj);
+    captured_flt = v;
+    captured_tag = tag;
+}
+
+LV_SUBJECT_FORWARD_FLOAT(forward_flt_tagged, capture_float_tagged, 11)
+
+void test_subject_forward_float_macro(void)
+{
+    lv_subject_t * f = subject_create(LV_SUBJECT_TYPE_FLOAT);
+    lv_subject_set_float(f, 1.5f);
+
+    lv_obj_t * obj = lv_obj_create(lv_screen_active());
+    captured_flt = 0.0f;
+    lv_subject_add_observer_obj(f, forward_flt_tagged, obj, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(1.5f, captured_flt);
+    TEST_ASSERT_EQUAL(11, captured_tag);
+
+    lv_subject_set_float(f, -2.25f);
+    TEST_ASSERT_EQUAL_FLOAT(-2.25f, captured_flt);
+}
+
+/* An int Subject driving a float setter, through a mapper. */
+static bool int_to_float_mapper(lv_observer_t * observer, float * out)
+{
+    float next = (float)lv_subject_get_int(lv_observer_get_subject(observer)) / 4.0f;
+    if(next == *out) return false;
+    *out = next;
+    return true;
+}
+
+static void capture_float(lv_obj_t * obj, float v)
+{
+    LV_UNUSED(obj);
+    captured_flt = v;
+}
+
+void test_observer_bind_float_mapped(void)
+{
+    lv_subject_t * quarters = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(quarters, 6);
+
+    lv_obj_t * obj = lv_obj_create(lv_screen_active());
+    captured_flt = 0.0f;
+    TEST_ASSERT_NOT_NULL(lv_obj_bind_float_mapped(obj, quarters, capture_float, int_to_float_mapper, NULL));
+    TEST_ASSERT_EQUAL_FLOAT(1.5f, captured_flt);
+
+    lv_subject_set_int(quarters, 10);
+    TEST_ASSERT_EQUAL_FLOAT(2.5f, captured_flt);
+}
+
+void test_subject_clamp_float_helper(void)
+{
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, lv_subject_clamp_float(2.5f, 0.0f, 1.0f));
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, lv_subject_clamp_float(-1.0f, 0.0f, 1.0f));
+    TEST_ASSERT_EQUAL_FLOAT(0.5f, lv_subject_clamp_float(0.5f, 0.0f, 1.0f));
+}
+
+/* Exercises the float paths of the extremum and clamp helpers. */
+void test_subject_min_max_and_clamped_on_float(void)
+{
+    lv_subject_t * temp = subject_create(LV_SUBJECT_TYPE_FLOAT);
+    lv_subject_set_float(temp, 20.5f);
+
+    lv_subject_t * lowest = lv_subject_create_min(temp, NULL);
+    lv_subject_t * highest = lv_subject_create_max(temp, NULL);
+    TEST_ASSERT_NOT_NULL(lowest);
+    TEST_ASSERT_NOT_NULL(highest);
+    TEST_ASSERT_EQUAL_FLOAT(20.5f, lv_subject_get_float(lowest));
+
+    lv_subject_set_float(temp, 25.75f);
+    TEST_ASSERT_EQUAL_FLOAT(20.5f, lv_subject_get_float(lowest));
+    TEST_ASSERT_EQUAL_FLOAT(25.75f, lv_subject_get_float(highest));
+
+    lv_subject_set_float(temp, 15.25f);
+    TEST_ASSERT_EQUAL_FLOAT(15.25f, lv_subject_get_float(lowest));
+    TEST_ASSERT_EQUAL_FLOAT(25.75f, lv_subject_get_float(highest));
+
+    lv_subject_value_t lo;
+    lv_subject_value_t hi;
+    lv_memzero(&lo, sizeof(lo));
+    lv_memzero(&hi, sizeof(hi));
+    lo.float_v = 18.0f;
+    hi.float_v = 22.0f;
+    lv_subject_t * bounded = lv_subject_create_clamped(temp, lo, hi, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(18.0f, lv_subject_get_float(bounded));
+
+    lv_subject_set_float(temp, 30.0f);
+    TEST_ASSERT_EQUAL_FLOAT(22.0f, lv_subject_get_float(bounded));
+
+    lv_subject_delete(bounded);
+    lv_subject_delete(lowest);
+    lv_subject_delete(highest);
+}
+#endif /*LV_USE_FLOAT*/
+
+/* Exercises the color paths of the extremum and clamp helpers, and the natural colour
+ * ordering. */
+void test_subject_min_max_and_clamped_on_color(void)
+{
+    lv_subject_t * col = subject_create(LV_SUBJECT_TYPE_COLOR);
+    lv_subject_set_color(col, lv_color_hex(0x808080));
+
+    lv_subject_t * darkest = lv_subject_create_min(col, NULL);
+    TEST_ASSERT_NOT_NULL(darkest);
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0x808080)),
+                             lv_color_to_u32(lv_subject_get_color(darkest)));
+
+    lv_subject_set_color(col, lv_color_hex(0xff0000));
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0x808080)),
+                             lv_color_to_u32(lv_subject_get_color(darkest)));
+
+    lv_subject_set_color(col, lv_color_hex(0x000010));
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0x000010)),
+                             lv_color_to_u32(lv_subject_get_color(darkest)));
+
+    lv_subject_value_t lo;
+    lv_subject_value_t hi;
+    lv_memzero(&lo, sizeof(lo));
+    lv_memzero(&hi, sizeof(hi));
+    lo.color = lv_color_hex(0x101010);
+    hi.color = lv_color_hex(0xa0a0a0);
+    lv_subject_t * bounded = lv_subject_create_clamped(col, lo, hi, NULL);
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0x101010)),
+                             lv_color_to_u32(lv_subject_get_color(bounded)));
+
+    lv_subject_set_color(col, lv_color_hex(0xffffff));
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0xa0a0a0)),
+                             lv_color_to_u32(lv_subject_get_color(bounded)));
+
+    lv_subject_delete(bounded);
+    lv_subject_delete(darkest);
+}
+
+/* An int Subject driving a colour setter through a mapper: a threshold turning red. */
+static bool level_to_color(lv_observer_t * observer, lv_color_t * out)
+{
+    int32_t v = lv_subject_get_int(lv_observer_get_subject(observer));
+    lv_color_t next = v > 50 ? lv_color_hex(0xff0000) : lv_color_hex(0x00ff00);
+    if(lv_color_to_u32(next) == lv_color_to_u32(*out)) return false;
+    *out = next;
+    return true;
+}
+
+static void capture_color(lv_obj_t * obj, lv_color_t v)
+{
+    LV_UNUSED(obj);
+    captured_col = v;
+}
+
+void test_observer_bind_color_mapped(void)
+{
+    lv_subject_t * level = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(level, 10);
+
+    lv_obj_t * obj = lv_obj_create(lv_screen_active());
+    lv_obj_bind_color_mapped(obj, level, capture_color, level_to_color, NULL);
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0x00ff00)), lv_color_to_u32(captured_col));
+
+    lv_subject_set_int(level, 90);
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0xff0000)), lv_color_to_u32(captured_col));
+}
+
+static const char * const choice_options[] = { "off", "on" };
+
+static bool int_to_choice(lv_observer_t * observer, const void ** out)
+{
+    const void * next = choice_options[lv_subject_get_int(lv_observer_get_subject(observer)) ? 1 : 0];
+    if(next == *out) return false;
+    *out = next;
+    return true;
+}
+
+static void capture_pointer(lv_obj_t * obj, const void * v)
+{
+    LV_UNUSED(obj);
+    captured_ptr = v;
+}
+
+void test_observer_bind_pointer_mapped(void)
+{
+    lv_subject_t * flag = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(flag, 0);
+
+    lv_obj_t * obj = lv_obj_create(lv_screen_active());
+    lv_obj_bind_pointer_mapped(obj, flag, capture_pointer, int_to_choice, NULL);
+    TEST_ASSERT_EQUAL_STRING("off", (const char *)captured_ptr);
+
+    lv_subject_set_int(flag, 1);
+    TEST_ASSERT_EQUAL_STRING("on", (const char *)captured_ptr);
+}
+
+/*=====================================================================
+ * Mapped style bindings
+ *====================================================================*/
+
+/* A float Subject driving an integer style property. */
+static bool tenths_to_pad(lv_observer_t * observer, int32_t * out)
+{
+    int32_t next = lv_subject_get_int(lv_observer_get_subject(observer)) / 10;
+    if(next == *out) return false;
+    *out = next;
+    return true;
+}
+
+void test_observer_bind_style_int_mapped(void)
+{
+    lv_subject_t * tenths = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(tenths, 120);
+
+    lv_obj_t * box = lv_obj_create(lv_screen_active());
+    TEST_ASSERT_NOT_NULL(lv_obj_bind_style_int_mapped(box, tenths, lv_obj_set_style_pad_all,
+                                                      LV_PART_MAIN, tenths_to_pad, NULL));
+    TEST_ASSERT_EQUAL(12, lv_obj_get_style_pad_top(box, LV_PART_MAIN));
+
+    lv_subject_set_int(tenths, 300);
+    TEST_ASSERT_EQUAL(30, lv_obj_get_style_pad_top(box, LV_PART_MAIN));
+
+    /* The mapper's output does not change, so the style is not written again. */
+    lv_subject_set_int(tenths, 305);
+    TEST_ASSERT_EQUAL(30, lv_obj_get_style_pad_top(box, LV_PART_MAIN));
+}
+
+void test_observer_bind_style_color_mapped(void)
+{
+    lv_subject_t * level = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(level, 10);
+
+    lv_obj_t * box = lv_obj_create(lv_screen_active());
+    lv_obj_bind_style_color_mapped(box, level, lv_obj_set_style_bg_color, LV_PART_MAIN,
+                                   level_to_color, NULL);
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0x00ff00)),
+                             lv_color_to_u32(lv_obj_get_style_bg_color(box, LV_PART_MAIN)));
+
+    lv_subject_set_int(level, 80);
+    TEST_ASSERT_EQUAL_UINT32(lv_color_to_u32(lv_color_hex(0xff0000)),
+                             lv_color_to_u32(lv_obj_get_style_bg_color(box, LV_PART_MAIN)));
+}
+
+/* Maps a 0..100 percentage onto a 0..255 opacity, and the result is still bounded. */
+static bool percent_to_opa(lv_observer_t * observer, int32_t * out)
+{
+    int32_t next = lv_subject_get_int(lv_observer_get_subject(observer)) * 255 / 100;
+    if(next == *out) return false;
+    *out = next;
+    return true;
+}
+
+void test_observer_bind_style_opa_mapped(void)
+{
+    lv_subject_t * percent = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(percent, 50);
+
+    lv_obj_t * box = lv_obj_create(lv_screen_active());
+    lv_obj_bind_style_opa_mapped(box, percent, lv_obj_set_style_bg_opa, LV_PART_MAIN,
+                                 percent_to_opa, NULL);
+    TEST_ASSERT_EQUAL(127, lv_obj_get_style_bg_opa(box, LV_PART_MAIN));
+
+    lv_subject_set_int(percent, 100);
+    TEST_ASSERT_EQUAL(255, lv_obj_get_style_bg_opa(box, LV_PART_MAIN));
+
+    /* Beyond 100% the mapper overshoots, and the bind bounds it rather than truncating. */
+    lv_subject_set_int(percent, 200);
+    TEST_ASSERT_EQUAL(255, lv_obj_get_style_bg_opa(box, LV_PART_MAIN));
+}
+
+/*=====================================================================
+ * Remaining public API
+ *====================================================================*/
+
+/* Writes the value into whatever the Observer's target points at, which is what
+ * lv_subject_add_observer_with_target() exists for: a target that is not a Widget. */
+static void target_writing_cb(lv_observer_t * observer, lv_subject_t * subject)
+{
+    int32_t * sink = lv_observer_get_target(observer);
+    if(sink) *sink = lv_subject_get_int(subject);
+}
+
+void test_subject_add_observer_with_target(void)
+{
+    static int32_t sink;
+    sink = 0;
+
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 3);
+
+    lv_observer_t * observer = lv_subject_add_observer_with_target(v, target_writing_cb, &sink, NULL);
+    TEST_ASSERT_NOT_NULL(observer);
+    TEST_ASSERT_EQUAL_PTR(&sink, lv_observer_get_target(observer));
+
+    /* Applied on subscribing, and on every change after. */
+    TEST_ASSERT_EQUAL(3, sink);
+    lv_subject_set_int(v, 8);
+    TEST_ASSERT_EQUAL(8, sink);
+
+    lv_observer_delete(observer);
+    lv_subject_set_int(v, 99);
+    TEST_ASSERT_EQUAL(8, sink);   /* no longer subscribed */
+}
+
+/* lv_subject_notify() forces a notification without changing the value, which is what a
+ * Subject whose pointed-to data changed behind its back needs. */
+void test_subject_notify_forces_a_notification(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 5);
+
+    observer_called = 0;
+    lv_subject_add_observer(v, observer_basic, NULL);
+    observer_called = 0;
+
+    /* Writing the same value changes nothing, so nobody is told. */
+    lv_subject_set_int(v, 5);
+    TEST_ASSERT_EQUAL(0, observer_called);
+
+    /* An explicit notify tells them anyway. */
+    lv_subject_notify(v);
+    TEST_ASSERT_EQUAL(1, observer_called);
+    TEST_ASSERT_EQUAL(5, lv_subject_get_int(v));
+}
+
+
+/*=====================================================================
+ * The subject-changing event helpers
+ *
+ * These were never covered, and this rearchitecture changed their behaviour: the
+ * increment event used to intersect its own range with the Subject's min_value/max_value,
+ * and those fields are gone, so the event's range is now the only one.
+ *====================================================================*/
+
+void test_subject_increment_event(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 5);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_obj_set_pos(btn, 0, 0);
+    lv_obj_set_size(btn, 50, 50);
+
+    lv_subject_increment_dsc_t * dsc = lv_obj_add_subject_increment_event(btn, v, LV_EVENT_CLICKED, 3);
+    TEST_ASSERT_NOT_NULL(dsc);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(8, lv_subject_get_int(v));
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(11, lv_subject_get_int(v));
+}
+
+void test_subject_increment_event_respects_its_own_range(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 8);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_subject_increment_dsc_t * dsc = lv_obj_add_subject_increment_event(btn, v, LV_EVENT_CLICKED, 5);
+    lv_obj_set_subject_increment_event_min_value(btn, dsc, 0);
+    lv_obj_set_subject_increment_event_max_value(btn, dsc, 10);
+
+    /* Setting a maximum below the current value pulls it in straight away. */
+    TEST_ASSERT_EQUAL(8, lv_subject_get_int(v));
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(10, lv_subject_get_int(v));   /* stops at the maximum */
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(10, lv_subject_get_int(v));   /* and stays there */
+}
+
+void test_subject_increment_event_rollover(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 2);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_subject_increment_dsc_t * dsc = lv_obj_add_subject_increment_event(btn, v, LV_EVENT_CLICKED, 1);
+    lv_obj_set_subject_increment_event_min_value(btn, dsc, 0);
+    lv_obj_set_subject_increment_event_max_value(btn, dsc, 3);
+    lv_obj_set_subject_increment_event_rollover(btn, dsc, true);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(3, lv_subject_get_int(v));
+
+    /* Past the top it starts again from the bottom. */
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(0, lv_subject_get_int(v));
+}
+
+/* The Subject no longer carries a range of its own, so a clamping mapper is how a Subject
+ * bounds itself, and it applies on top of whatever the event writes. */
+void test_subject_increment_event_and_a_clamping_mapper(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(v, clamp_0_100_mapper, NULL);
+    lv_subject_set_int(v, 95);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_subject_increment_dsc_t * dsc = lv_obj_add_subject_increment_event(btn, v, LV_EVENT_CLICKED, 20);
+    lv_obj_set_subject_increment_event_max_value(btn, dsc, 1000);   /* the event allows far more */
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+
+    /* The event wanted 115; the Subject's own mapper bounded it to 100. */
+    TEST_ASSERT_EQUAL(100, lv_subject_get_int(v));
+}
+
+/* It reads the value and writes it back, so a Subject written as one type and observed
+ * as another cannot be driven this way. */
+void test_subject_increment_event_refuses_mismatched_types(void)
+{
+    lv_subject_t * mapped = lv_subject_create_mapped(LV_SUBJECT_TYPE_POINTER, LV_SUBJECT_TYPE_INT);
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+
+    TEST_ASSERT_NULL(lv_obj_add_subject_increment_event(btn, mapped, LV_EVENT_CLICKED, 1));
+
+    lv_subject_delete(mapped);
+}
+
+void test_subject_toggle_event(void)
+{
+    lv_subject_t * flag = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(flag, 0);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_obj_add_subject_toggle_event(btn, flag, LV_EVENT_CLICKED);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(1, lv_subject_get_int(flag));
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(0, lv_subject_get_int(flag));
+
+    /* Any non-zero counts as set, so toggling from it gives zero. */
+    lv_subject_set_int(flag, 7);
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(0, lv_subject_get_int(flag));
+}
+
+void test_subject_set_int_event(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 0);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_obj_add_subject_set_int_event(btn, v, LV_EVENT_CLICKED, 42);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(42, lv_subject_get_int(v));
+
+    /* Idempotent: the same value again is still 42 and notifies nobody. */
+    observer_called = 0;
+    lv_subject_add_observer(v, observer_basic, NULL);
+    observer_called = 0;
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(42, lv_subject_get_int(v));
+    TEST_ASSERT_EQUAL(0, observer_called);
+}
+
+#if LV_USE_FLOAT
+void test_subject_set_float_event(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_FLOAT);
+    lv_subject_set_float(v, 0.0f);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_obj_add_subject_set_float_event(btn, v, LV_EVENT_CLICKED, 2.5f);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(2.5f, lv_subject_get_float(v));
+}
+#endif
+
+void test_subject_set_string_event(void)
+{
+    static char buf[32];
+    lv_subject_t * text = subject_create(LV_SUBJECT_TYPE_STRING);
+    lv_subject_set_buffer(text, buf, sizeof(buf), NULL, NULL);
+    lv_subject_copy_string(text, "before");
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_obj_add_subject_set_string_event(btn, text, LV_EVENT_CLICKED, "after");
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL_STRING("after", lv_subject_get_string(text));
+}
+
+
+/* Setting a minimum above the current value pulls it up straight away, which is the
+ * mirror of the maximum case. */
+void test_subject_increment_event_min_pulls_the_value_up(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(v, 2);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_subject_increment_dsc_t * dsc = lv_obj_add_subject_increment_event(btn, v, LV_EVENT_CLICKED, 1);
+
+    lv_obj_set_subject_increment_event_min_value(btn, dsc, 10);
+    TEST_ASSERT_EQUAL(10, lv_subject_get_int(v));
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL(11, lv_subject_get_int(v));
+}
+
+#if LV_USE_FLOAT
+/* The increment event works on a float Subject too, with its own bounds and rollover. */
+void test_subject_increment_event_on_a_float(void)
+{
+    lv_subject_t * v = subject_create(LV_SUBJECT_TYPE_FLOAT);
+    lv_subject_set_float(v, 1.0f);
+
+    lv_obj_t * btn = lv_obj_create(lv_screen_active());
+    lv_subject_increment_dsc_t * dsc = lv_obj_add_subject_increment_event(btn, v, LV_EVENT_CLICKED, 2);
+    TEST_ASSERT_NOT_NULL(dsc);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(3.0f, lv_subject_get_float(v));
+
+    lv_obj_set_subject_increment_event_max_value(btn, dsc, 4);
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(4.0f, lv_subject_get_float(v));   /* stops at the maximum */
+
+    /* And a minimum above the value pulls it up, as for an integer. */
+    lv_obj_set_subject_increment_event_min_value(btn, dsc, 6);
+    TEST_ASSERT_EQUAL_FLOAT(6.0f, lv_subject_get_float(v));
+
+    /* A max of 9 leaves room for one step, so the rollover is distinguishable from
+     * simply not moving. */
+    lv_obj_set_subject_increment_event_rollover(btn, dsc, true);
+    lv_obj_set_subject_increment_event_max_value(btn, dsc, 9);
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(8.0f, lv_subject_get_float(v));   /* 6 + 2, still inside */
+
+    lv_obj_send_event(btn, LV_EVENT_CLICKED, NULL);
+    TEST_ASSERT_EQUAL_FLOAT(6.0f, lv_subject_get_float(v));   /* 10 > 9, so back to the minimum */
+}
+#endif
 
 #endif

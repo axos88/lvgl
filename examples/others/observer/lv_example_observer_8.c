@@ -6,7 +6,7 @@ static lv_subject_t * subject_adc;
 /*The same reading as a temperature in kelvin, derived from the one above*/
 static lv_subject_t * subject_kelvin;
 
-static bool adc_to_kelvin_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value);
+static bool adc_to_kelvin_mapper(lv_subject_t * subject, void * user_data, int32_t * value);
 static bool kelvin_to_celsius_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out);
 static bool kelvin_to_fahrenheit_text(lv_observer_t * observer, lv_subject_value_t input, const char ** out);
 
@@ -61,11 +61,10 @@ void lv_example_observer_8(void)
 }
 
 /*The sensor's scale lives here and nowhere else. 0..4095 counts span 250..350 K.*/
-static bool adc_to_kelvin_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+static bool adc_to_kelvin_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
-    LV_UNUSED(input);
 
     int32_t counts = lv_subject_get_int(subject_adc);
     int32_t kelvin = 250 + (counts * 100) / 4095;

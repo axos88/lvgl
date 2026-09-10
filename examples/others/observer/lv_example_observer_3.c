@@ -14,7 +14,7 @@ const char * minute_options =
 static void set_btn_clicked_event_cb(lv_event_t * e);
 static void close_clicked_event_cb(lv_event_t * e);
 static void hour_roller_options_update(lv_observer_t * observer, lv_subject_t * subject);
-static bool time_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, const void ** value);
+static bool time_mapper(lv_subject_t * subject, void * user_data, const void ** value);
 static void time_observer_cb(lv_observer_t * observer, lv_subject_t * subject);
 
 typedef enum {
@@ -164,10 +164,9 @@ static void close_clicked_event_cb(lv_event_t * e)
  *
  *The struct lives in the mapper's captured state (`user_data`), so the mapper stays
  *reusable and the example needs no allocation.*/
-static bool time_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, const void ** value)
+static bool time_mapper(lv_subject_t * subject, void * user_data, const void ** value)
 {
     LV_UNUSED(subject);
-    LV_UNUSED(input);
 
     datetime_t * datetime = user_data;
 

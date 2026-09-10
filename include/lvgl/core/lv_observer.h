@@ -50,6 +50,33 @@ typedef enum {
 } lv_subject_type_t;
 
 /**
+ * How a Subject converts between `int32_t` and `float`.
+ *
+ * An `int` read as a `float` is exact and needs no policy. The other direction has to
+ * decide what to do with the fraction, and this says which. It applies in both
+ * directions of a type mismatch, so it is a property of the Subject and not of the
+ * float: reading a float Subject with `lv_subject_get_int()` and writing an int Subject
+ * with `lv_subject_set_float()` both follow it.
+ */
+typedef enum {
+    LV_SUBJECT_ROUND_NEAREST =     0,   /**< 2.5 -> 3, -2.5 -> -3. The default. */
+    LV_SUBJECT_ROUND_TOWARD_ZERO = 1,   /**< 2.9 -> 2, -2.9 -> -2 */
+    LV_SUBJECT_ROUND_EXACT =       2,   /**< Every conversion has to be lossless. A write
+                                         *   that is not is refused and the Subject keeps
+                                         *   the value it had. A plain read still answers
+                                         *   with the nearest integer, because a getter
+                                         *   that returned nothing would be worse than one
+                                         *   that rounds; use
+                                         *   `lv_subject_get_int_checked()` to be told. */
+} lv_subject_rounding_t;
+
+/**
+ * The largest `int32_t` a `float` holds exactly. A `float` has 24 bits of mantissa, so
+ * above this it starts dropping low bits: 16777217 stored in one reads back as 16777216.
+ */
+#define LV_SUBJECT_INT_EXACT_IN_FLOAT 16777216
+
+/**
  * A common type to handle all the various observable types in the same way
  */
 typedef union {
@@ -67,10 +94,23 @@ typedef union {
 typedef enum {
     /** Only mark the Subject dirty when a dependency changes. The mapper runs when the
      * value is read, when an eager dependent pulls it, or at the next
-     * `lv_subject_flush()`. A lazy Subject's mapper must be pure. */
+     * `lv_subject_flush()`. Because it may be skipped any number of times, a lazy
+     * mapper must be a function of its inputs alone. */
     LV_SUBJECT_MODE_LAZY  = 0,
-    /** Re-evaluate and notify inside the `lv_subject_set_...()` call that dirtied it.
-     * An eager Subject's mapper may have side effects. */
+    /** Re-evaluate at the end of every transaction that dirtied it, whether or not
+     * anything reads the value.
+     *
+     * That is what makes an **accumulating** mapper possible: it runs exactly once per
+     * transaction, so reading its own previous value through `*value` is well defined.
+     * A peak-hold, a running total or an edge counter needs this. Under
+     * `LV_SUBJECT_MODE_LAZY` the same mapper would count reads instead of changes.
+     *
+     * It sees every transaction, which is not quite every write: a bare
+     * `lv_subject_set_...()` is a transaction of its own, so nothing is missed there,
+     * but two writes to one source inside an explicit transaction commit once and the
+     * intermediate value is never visible. That is deliberate — a transaction is
+     * atomic, so its intermediate states do not exist as far as anything outside is
+     * concerned. */
     LV_SUBJECT_MODE_EAGER = 1,
 } lv_subject_mode_t;
 
@@ -95,56 +135,45 @@ typedef enum {
  * The mapper owns the Subject's value: it is the only thing that writes it, and it
  * decides what counts as a change.
  *
+ * A mapper takes no input: a Subject with a mapper is computed, not written. It reads
+ * the Subjects it needs and returns whether it changed the value. To make such a Subject
+ * writable, give it a setter, which inverts the mapper: see @ref lv_subject_set_int_setter.
+ *
  * @param subject     pointer to Subject being evaluated
  * @param user_data   the pointer given to `lv_subject_set_int_mapper()`. Use it to
  *                    reach the other Subjects and state the mapper needs, the way a
  *                    closure captures variables.
- * @param input       the value most recently written with a `lv_subject_set_...()`
- *                    call. Read the member matching the Subject's **input type**, which
- *                    need not be the type of its value: see
- *                    @ref lv_subject_create_mapped. On a re-evaluation caused by a
- *                    dependency change it is still that last written value, so a mapper
- *                    can re-derive from the original input.
  * @param value       in/out pointer to the Subject's stored value. It holds the value
  *                    from the previous evaluation on entry. Save it to a local first if
  *                    you need to compare against it.
  * @return            `true` if the mapper changed `*value`, `false` otherwise
  *
  * @note Every `lv_subject_get_...()` call made from a mapper registers the Subject it
- *       read as a dependency of `subject`.
- * @note A pointer input is **retained**: a re-evaluation gets the same pointer the last
- *       write carried. The caller answers for it, and has to keep it valid until a new
- *       input is written, or transfer ownership with `lv_subject_set_pointer_owned()`.
- * @note A string input is the exception: `input.pointer` is the written string on a
- *       write and NULL on a re-evaluation. `lv_subject_snprintf()` formats into a
- *       temporary it frees before returning, so keeping that pointer would dangle, and
- *       it is not needed anyway: a string mapper re-derives from `buf`, which still
- *       holds the last value. This concerns the input only; a string Subject's *value*
- *       is retained in its buffer.
+ *       read as a dependency of `subject`, so the dependency graph is rebuilt on every
+ *       evaluation and a branch that was not taken is not a dependency.
+ * @note A lazy mapper may be skipped any number of times, so it has to be a function of
+ *       its inputs alone. Reading `*value` to accumulate needs
+ *       `LV_SUBJECT_MODE_EAGER`: see @ref lv_subject_set_mode.
  * @warning A mapper must not write any Subject. Doing so is ignored and logs a warning.
  */
-typedef bool (*lv_subject_int_mapper_t)(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                        int32_t * value);
+typedef bool (*lv_subject_int_mapper_t)(lv_subject_t * subject, void * user_data, int32_t * value);
 
 #if LV_USE_FLOAT
 /**
  * Mapper of a Subject whose value is a float. See @ref lv_subject_int_mapper_t.
  */
-typedef bool (*lv_subject_float_mapper_t)(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                          float * value);
+typedef bool (*lv_subject_float_mapper_t)(lv_subject_t * subject, void * user_data, float * value);
 #endif
 
 /**
  * Mapper of a Subject whose value is a pointer. See @ref lv_subject_int_mapper_t.
  */
-typedef bool (*lv_subject_pointer_mapper_t)(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                            const void ** value);
+typedef bool (*lv_subject_pointer_mapper_t)(lv_subject_t * subject, void * user_data, const void ** value);
 
 /**
  * Mapper of a Subject whose value is a color. See @ref lv_subject_int_mapper_t.
  */
-typedef bool (*lv_subject_color_mapper_t)(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                          lv_color_t * value);
+typedef bool (*lv_subject_color_mapper_t)(lv_subject_t * subject, void * user_data, lv_color_t * value);
 
 /**
  * Mapper of a Subject whose value is a string. See @ref lv_subject_int_mapper_t.
@@ -155,13 +184,11 @@ typedef bool (*lv_subject_color_mapper_t)(lv_subject_t * subject, void * user_da
  *
  * @param subject     pointer to Subject being evaluated
  * @param user_data   the pointer given to `lv_subject_set_string_mapper()`
- * @param input       the most recently written value, as for @ref lv_subject_int_mapper_t
  * @param buf         the Subject's string buffer, holding the previous value on entry
  * @param size        size of `buf`
  * @return            `true` if the mapper changed the contents of `buf`
  */
-typedef bool (*lv_subject_string_mapper_t)(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                           char * buf, size_t size);
+typedef bool (*lv_subject_string_mapper_t)(lv_subject_t * subject, void * user_data, char * buf, size_t size);
 
 /**
  * Mapper of an `LV_SUBJECT_TYPE_NONE` Subject, which has no value of its own and
@@ -174,8 +201,7 @@ typedef bool (*lv_subject_string_mapper_t)(lv_subject_t * subject, void * user_d
 typedef bool (*lv_subject_none_mapper_t)(lv_subject_t * subject, void * user_data);
 
 /**
- * Orders two Subject values. Used by the `lv_subject_create_min()`,
- * `lv_subject_create_max()` and `lv_subject_create_clamped()` helpers, which cannot
+ * Orders two Subject values. Used by `lv_subject_create_clamped()`, which cannot
  * know how to order a pointer.
  * @param subject   pointer to the Subject being evaluated
  * @param a         one value
@@ -209,6 +235,66 @@ typedef union {
     lv_subject_string_mapper_t string_cb;    /**< Value is a string */
     lv_subject_none_mapper_t none_cb;        /**< LV_SUBJECT_TYPE_NONE */
 } lv_subject_mapper_t;
+
+/**
+ * Setter of a Subject that has a mapper.
+ *
+ * A Subject with a mapper computes its value, so it cannot simply be written. A setter
+ * makes it writable anyway by translating the write into writes on the Subjects the
+ * mapper reads — it inverts the mapper's own step.
+ *
+ * Setters chain. A Celsius Subject derived from Kelvin writes Kelvin, whose own setter
+ * writes the raw ADC reading. Each one only has to invert its own step.
+ *
+ * The setter runs inside a transaction, so it may read Subjects as well as write them,
+ * and everything it writes settles before any Observer is notified.
+ *
+ * @param subject     the Subject being written
+ * @param user_data   the pointer given to `lv_subject_set_int_setter()`
+ * @param value       the value that was written
+ * @return            `true` if the write was applied, `false` to abort the transaction
+ *
+ * @note The Subject's own value is **not** set to `value`. Its mapper recomputes it from
+ *       whatever the setter wrote, so writing 30 to an area with integer factors can
+ *       leave it at 28. A two-way bound widget has to accept that.
+ * @note Returning `false` rolls the whole transaction back, including any outer one.
+ */
+typedef bool (*lv_subject_int_setter_t)(lv_subject_t * subject, void * user_data, int32_t value);
+
+#if LV_USE_FLOAT
+/** Setter of a float Subject. See @ref lv_subject_int_setter_t. */
+typedef bool (*lv_subject_float_setter_t)(lv_subject_t * subject, void * user_data, float value);
+#endif
+
+/** Setter of a color Subject. See @ref lv_subject_int_setter_t. */
+typedef bool (*lv_subject_color_setter_t)(lv_subject_t * subject, void * user_data, lv_color_t value);
+
+/**
+ * Setter of a pointer Subject. See @ref lv_subject_int_setter_t.
+ *
+ * `value` is the pointer that was written. Which of the three pointer writes was used —
+ * borrowed, owned or copied — is the *caller's* business; a setter is handed the pointer
+ * and decides for itself how to pass it on. Writing it onwards with
+ * `lv_subject_set_pointer_owned()` when it arrived borrowed would be wrong, so pass on
+ * what you were given.
+ */
+typedef bool (*lv_subject_pointer_setter_t)(lv_subject_t * subject, void * user_data, void * value);
+
+/** Setter of a string Subject. See @ref lv_subject_pointer_setter_t. */
+typedef bool (*lv_subject_string_setter_t)(lv_subject_t * subject, void * user_data, const char * value);
+
+/**
+ * A Subject's setter, selected by the type of the Subject's value.
+ */
+typedef union {
+    lv_subject_int_setter_t int_cb;          /**< Value is an int32_t */
+#if LV_USE_FLOAT
+    lv_subject_float_setter_t float_cb;      /**< Value is a float */
+#endif
+    lv_subject_color_setter_t color_cb;      /**< Value is a color */
+    lv_subject_pointer_setter_t pointer_cb;  /**< Value is a pointer */
+    lv_subject_string_setter_t string_cb;    /**< Value is a string */
+} lv_subject_setter_t;
 
 /**
  * Called just before a Subject is destroyed, to release whatever the application
@@ -260,11 +346,10 @@ struct _lv_subject_t {
 #endif
     lv_ll_t subs_ll;                     /**< Subscribers */
     lv_subject_value_t value;            /**< Current value, written only by the mapper */
-    lv_subject_value_t last_input;       /**< Value most recently passed to `lv_subject_set_...()`,
-                                          * handed to the mapper on a re-evaluation. Unused for
-                                          * `LV_SUBJECT_TYPE_STRING`, which does not retain it. */
     lv_subject_mapper_t mapper;          /**< Maps the input to the stored value */
     void * mapper_user_data;             /**< Passed to `mapper`, the mapper's captured state */
+    lv_subject_setter_t setter;          /**< Turns a write into writes on the mapper's sources */
+    void * setter_user_data;             /**< Passed to `setter` */
     lv_subject_value_free_cb_t value_free_cb; /**< Releases an owned pointer value */
     lv_subject_buf_t * buf;              /**< Set when the Subject copies its value @nullable */
     lv_subject_delete_cb_t delete_cb;    /**< Called just before the Subject is destroyed @nullable */
@@ -273,30 +358,48 @@ struct _lv_subject_t {
 
     lv_ll_t deps;                        /**< Subjects this one read during its last evaluation */
     lv_ll_t dependents;                  /**< Subjects that read this one */
+
+    /* The static graph, which governs lifetime rather than propagation. `deps` above
+     * holds only what the last evaluation actually read, so a Subject on a branch that
+     * was not taken looks unreferenced and could be deleted out from under a later
+     * evaluation. These edges cover every branch instead, and they do not change. */
+    lv_subject_t * const * static_deps;   /**< Every Subject the mapper or setter could touch.
+                                           * Caller-owned, so it has to outlive the Subject.
+                                           * @nullable */
+    uint32_t static_dep_cnt;             /**< Entries in `static_deps` */
+    uint32_t static_ref_cnt;             /**< How many Subjects name this one in their
+                                          * `static_deps`. Deleting is refused while it is
+                                          * above zero. */
     uint16_t immediate_observer_cnt;     /**< Observers with LV_OBSERVER_MODE_IMMEDIATE */
     uint32_t version;                    /**< Bumped on every actual value change. A dependent
                                           * compares it against the version it last read to
-                                          * decide whether its mapper has to run at all. */
+                                          * decide whether its mapper has to run at all. Private:
+                                          * only ever tested for equality. */
+    uint32_t changed_at;                 /**< Id of the transaction in which the value last
+                                          * actually changed. Subjects written in the same
+                                          * transaction share it, because they changed together.
+                                          * This is what `lv_subject_get_changed_at()` returns.
+                                          * It cannot share storage with `version`: two writes to
+                                          * one Subject inside a single transaction would leave
+                                          * the stamp equal, and a dependent that read it in
+                                          * between would wrongly skip its mapper. */
 
     uint32_t type                 :  4;  /**< Type of the *value*, i.e. what Observers see.
                                           * One of the LV_SUBJECT_TYPE_... values. */
-    uint32_t input_type           :  4;  /**< Type accepted by the `lv_subject_set_...()`
-                                          * functions. Equal to `type` unless the Subject was
-                                          * made with `lv_subject_create_mapped()`. */
-    uint32_t input_pending        :  1;  /**< A write was recorded but its mapper has not run
-                                          * yet, so the pending work is not only a stale
-                                          * dependency and the mapper must not be skipped. */
     uint32_t copy_changed         :  1;  /**< Did the last copy into `buf` change the bytes?
                                           * Computed by the copying setters, which have the
                                           * old bytes to hand, and used for change detection. */
     uint32_t notify_restart_query :  1;  /**< If an Observer was deleted during notification,
                                           * start notifying from the beginning. */
     uint32_t mode                 :  1;  /**< One of the LV_SUBJECT_MODE_... values */
+    uint32_t rounding             :  2;  /**< One of the LV_SUBJECT_ROUND_... values */
     uint32_t dirty                :  1;  /**< A dependency changed, so the mapper has to run again */
     uint32_t pending_notify       :  1;  /**< Value is up to date but the Observers have not
                                           * been told yet. */
     uint32_t evaluating           :  1;  /**< Re-entrancy guard, used to detect dependency cycles */
     uint32_t has_mapper           :  1;  /**< Is `mapper` set? */
+    uint32_t has_setter           :  1;  /**< Is `setter` set? A Subject with a mapper is
+                                          * read-only unless this is set. */
     uint32_t in_list              :  1;  /**< Is the Subject in LVGL's global Subject list?
                                           * False for a Subject set up with a deprecated
                                           * `lv_subject_init_...()`, which the application owns. */
@@ -305,8 +408,6 @@ struct _lv_subject_t {
                                           * with the Subject. */
     uint32_t owns_value           :  1;  /**< The Subject owns the data its stored pointer
                                           * value refers to. */
-    uint32_t owns_input           :  1;  /**< The Subject owns the data its retained input
-                                          * pointer refers to. */
 };
 
 /**
@@ -467,51 +568,6 @@ typedef void (*lv_obj_set_pointer_t)(lv_obj_t * obj, const void * value);
  */
 lv_subject_t * lv_subject_create(lv_subject_type_t type);
 
-/**
- * Create a Subject that is written as one type and observed as another.
- *
- * The `lv_subject_set_...()` function matching `input_type` is the one that writes it,
- * and the `lv_subject_get_...()` function matching `value_type` is the one that reads
- * it. The mapper converts, and it is the mapper for `value_type`.
- *
- * This collapses what would otherwise be two Subjects — a source and a derived one —
- * into a single one, for the common case where the raw form is of no interest to
- * anybody:
- *
- * ```c
- * // Set with a temperature, observed as a level
- * lv_subject_t * level = lv_subject_create_mapped(LV_SUBJECT_TYPE_FLOAT, LV_SUBJECT_TYPE_INT);
- * lv_subject_set_int_mapper(level, level_mapper, NULL);
- *
- * static bool level_mapper(lv_subject_t * s, void * ud, lv_subject_value_t input, int32_t * value)
- * {
- *     int32_t next = input.float_v > 80.0f ? LEVEL_CRITICAL :
- *                    input.float_v > 60.0f ? LEVEL_HIGH : LEVEL_NORMAL;
- *     if(next == *value) return false;
- *     *value = next;
- *     return true;
- * }
- *
- * lv_subject_set_float(level, 72.5f);      // written as a float
- * lv_subject_get_int(level);               // read as LEVEL_HIGH
- * ```
- *
- * @param input_type    the type the `lv_subject_set_...()` functions accept
- * @param value_type    the type of the stored value, i.e. what Observers see
- * @return              the new Subject, or NULL on failure
- * @note                Such a Subject needs a mapper; without one there is nothing to
- *                      convert with, and a write logs a warning and is ignored.
- * @note                Pass the same type twice to get exactly what
- *                      `lv_subject_create()` gives you.
- */
-lv_subject_t * lv_subject_create_mapped(lv_subject_type_t input_type, lv_subject_type_t value_type);
-
-/**
- * Get the type a Subject's `lv_subject_set_...()` functions accept.
- * @param subject   pointer to Subject
- * @return          the input type, equal to the value type for an ordinary Subject
- */
-lv_subject_type_t lv_subject_get_input_type(const lv_subject_t * subject);
 
 /**
  * Delete a Subject.
@@ -521,10 +577,12 @@ lv_subject_type_t lv_subject_get_input_type(const lv_subject_t * subject);
  * Delete the dependents first, or use `lv_subject_delete_cascade()`.
  *
  * @param subject   the subject to delete @nullable
+ * @return          `LV_RESULT_OK` if the Subject was deleted, `LV_RESULT_INVALID` if the
+ *                  delete was refused
  * @note            Subjects still alive when `lv_deinit()` is called are deleted
  *                  automatically, regardless of their dependencies.
  */
-void lv_subject_delete(lv_subject_t * subject);
+lv_result_t lv_subject_delete(lv_subject_t * subject);
 
 /**
  * Delete a Subject together with everything that depends on it.
@@ -924,12 +982,30 @@ void lv_subject_set_none_mapper(lv_subject_t * subject, lv_subject_none_mapper_t
 
 /**
  * Set when a Subject with a mapper re-evaluates.
+ *
+ * The reason to choose `LV_SUBJECT_MODE_EAGER` is an accumulating mapper — one that
+ * reads its own previous value and so has to run once per change rather than once per
+ * read:
+ *
+ * ```c
+ * static bool peak_mapper(lv_subject_t * s, void * ud, int32_t * value)
+ * {
+ *     int32_t now = lv_subject_get_int(&reading);
+ *     if(now <= *value) return false;
+ *     *value = now;                 // the peak so far
+ *     return true;
+ * }
+ * lv_subject_set_int_mapper(peak, peak_mapper, NULL);
+ * lv_subject_set_mode(peak, LV_SUBJECT_MODE_EAGER);
+ * ```
+ *
  * @param subject   pointer to Subject
  * @param mode      `LV_SUBJECT_MODE_LAZY` (the default) or `LV_SUBJECT_MODE_EAGER`
  * @note            An Observer with `LV_OBSERVER_MODE_IMMEDIATE` makes a lazy Subject
- *                  act as an eager one for as long as it is subscribed. That changes
- *                  when the mapper runs, not what it is allowed to do: a lazy
- *                  Subject's mapper must stay pure.
+ *                  evaluate at every commit too, for as long as it is subscribed. That
+ *                  changes when the mapper runs, not what it is allowed to do: a lazy
+ *                  mapper must still be a function of its inputs alone, because the
+ *                  Observer can be removed again.
  */
 void lv_subject_set_mode(lv_subject_t * subject, lv_subject_mode_t mode);
 
@@ -945,7 +1021,7 @@ lv_subject_mode_t lv_subject_get_mode(const lv_subject_t * subject);
  * Tell whether a Subject currently evaluates eagerly, i.e. whether it is declared
  * `LV_SUBJECT_MODE_EAGER` or has at least one `LV_OBSERVER_MODE_IMMEDIATE` Observer.
  * @param subject   pointer to Subject
- * @return          `true` if the Subject re-evaluates inside `lv_subject_set_...()`
+ * @return          `true` if the Subject re-evaluates at every transaction commit
  */
 bool lv_subject_is_eager(const lv_subject_t * subject);
 
@@ -1006,6 +1082,312 @@ lv_subject_t * lv_subject_get_dependency(const lv_subject_t * subject, uint32_t 
  *       something reads it or when an eager dependent pulls it.
  */
 void lv_subject_flush(void);
+
+/**
+ * Start a transaction, so a group of writes settles before anything hears about it.
+ *
+ * Writes take effect as they are made: a read inside the transaction sees the new value,
+ * which is what lets a chain of setters work. What waits for the commit is
+ * *notification*, so an Observer never sees a half-updated graph. Two Subjects feeding
+ * one dependent therefore cost one notification, not two.
+ *
+ * Transactions nest as a depth counter. Only the outermost commit notifies.
+ *
+ * A bare `lv_subject_set_...()` is an implicit transaction of its own, so there is only
+ * one code path and a Subject written on its own behaves exactly as it did before
+ * transactions existed.
+ *
+ * @note Not thread safe, like the rest of LVGL. The depth is global.
+ */
+void lv_subject_transaction_begin(void);
+
+/**
+ * End a transaction started with @ref lv_subject_transaction_begin.
+ *
+ * At depth zero this evaluates the Subjects that are due and notifies their Observers.
+ *
+ * A transaction does not always survive to be committed: a Subject with a setter may
+ * refuse a write, and a refusal rolls back every write the transaction made. There is
+ * no other way to find out, because a rolled back transaction changes nothing and so
+ * notifies nobody. Always pair a begin with a commit and read the result.
+ *
+ * @return  LV_RESULT_OK      the transaction committed.
+ *          LV_RESULT_INVALID it had already been rolled back, or no transaction was
+ *                            open. Either way nothing was committed.
+ */
+lv_result_t lv_subject_transaction_commit(void);
+
+/**
+ * Id of the transaction in which this Subject's value last actually changed.
+ *
+ * Subjects written in the same transaction share the id: they changed together, and the
+ * model does not pretend to order them. Use it to tell which of two Subjects changed
+ * first, e.g. to pick the dimension that was touched longest ago.
+ *
+ * A value that is written but does not change does not move the id.
+ *
+ * @param subject   pointer to a Subject
+ * @return          the transaction id
+ *
+ * @note This evaluates the Subject first if it is dirty. A lazily computed Subject's
+ *       stamp is stale until its mapper has run, so comparing without evaluating would
+ *       give the wrong answer.
+ * @warning The id wraps. Compare two of them with a signed difference,
+ *          `(int32_t)(a - b) < 0`, never with `a < b`.
+ */
+uint32_t lv_subject_get_changed_at(lv_subject_t * subject);
+
+/**
+ * Id of the transaction in progress, or of the last one if none is open.
+ *
+ * The same counter `lv_subject_get_changed_at()` reports, read directly. Every write is
+ * at least an implicit transaction, so a change in this value marks the boundary between
+ * one write's cascade and the next — which is what makes it useful to a trace or a
+ * debugger view.
+ *
+ * @return  the transaction id
+ */
+uint32_t lv_subject_get_transaction_id(void);
+
+/**
+ * Read a Subject's value **without** the read counting as a dependency.
+ *
+ * A mapper's dependencies are normally whatever it read, which is what makes a branch
+ * that was not taken not fire. Sometimes that is not precise enough: deciding *which*
+ * Subject matters may need a look at one that then turns out to be irrelevant.
+ *
+ * ```c
+ * // area = w * h, but zero on either side makes the other irrelevant.
+ * if(lv_subject_peek_int(&w) == 0) { lv_subject_track_dependency(&w); return 0; }
+ * if(lv_subject_peek_int(&h) == 0) { lv_subject_track_dependency(&h); return 0; }
+ * return lv_subject_get_int(&w) * lv_subject_get_int(&h);
+ * ```
+ *
+ * Each case ends up depending on exactly what its answer rests on. Written as one
+ * guarded expression it could not: `w > 0 && h > 0` has already read `w` by the time it
+ * finds `h` zero, so a write to `w` would re-run it for nothing.
+ *
+ * The value is brought up to date first, exactly as a tracked read would.
+ *
+ * @param subject   pointer to a Subject
+ * @return          its value
+ *
+ * @warning A peek that is not followed by `lv_subject_track_dependency()` on something
+ *          that decides the same answer leaves the Subject stale: nothing will
+ *          re-evaluate it when the peeked value changes.
+ * @see lv_subject_track_dependency
+ */
+/**
+ * Register `subject` as a dependency of the Subject currently being evaluated.
+ *
+ * Every `lv_subject_get_...()` does this by itself, so a mapper that simply reads what
+ * it needs never has to. It is public for the other half of @ref lv_subject_peek_int:
+ * having looked without subscribing, this is how a mapper says what its answer actually
+ * rests on.
+ *
+ * Outside an evaluation it does nothing, so it is safe to call anywhere.
+ *
+ * @param subject   the Subject to depend on
+ */
+void lv_subject_track_dependency(lv_subject_t * subject);
+
+int32_t lv_subject_peek_int(lv_subject_t * subject);
+
+#if LV_USE_FLOAT
+/** See @ref lv_subject_peek_int. */
+float lv_subject_peek_float(lv_subject_t * subject);
+#endif
+
+/** See @ref lv_subject_peek_int. */
+lv_color_t lv_subject_peek_color(lv_subject_t * subject);
+
+/** See @ref lv_subject_peek_int. */
+const char * lv_subject_peek_string(lv_subject_t * subject);
+
+/** See @ref lv_subject_peek_int. */
+const void * lv_subject_peek_pointer(lv_subject_t * subject);
+
+/**
+ * Say how this Subject converts between `int32_t` and `float`.
+ *
+ * A Subject can be read and written as either type. An `int` read as a `float` is exact.
+ * A `float` read as an `int` is not, and this decides what happens to the fraction:
+ *
+ * ```c
+ * lv_subject_t * temp = lv_subject_create(LV_SUBJECT_TYPE_FLOAT);
+ * lv_subject_set_float(temp, 21.7f);
+ *
+ * lv_subject_get_int(temp);                                    // 22, the default
+ * lv_subject_set_rounding(temp, LV_SUBJECT_ROUND_TOWARD_ZERO);
+ * lv_subject_get_int(temp);                                    // 21
+ * ```
+ *
+ * It applies in both directions, so it is worth setting on an `int` Subject too: that is
+ * what `lv_subject_set_float()` on one follows.
+ *
+ * @param subject   pointer to a Subject
+ * @param rounding  one of the `LV_SUBJECT_ROUND_...` values
+ *
+ * @note The default is `LV_SUBJECT_ROUND_NEAREST`. Truncating would show 4.9 as 4, which
+ *       matters when a float Subject exists precisely so the arithmetic behind it keeps
+ *       its precision while a widget shows whole numbers.
+ */
+void lv_subject_set_rounding(lv_subject_t * subject, lv_subject_rounding_t rounding);
+
+/**
+ * Read a Subject as an `int32_t`, and be told whether anything was lost.
+ *
+ * `lv_subject_get_int()` cannot report: it returns the value itself. This can. It always
+ * stores a value, so a caller that ignores the result is no worse off than one calling
+ * the plain getter.
+ *
+ * ```c
+ * int32_t v;
+ * if(lv_subject_get_int_checked(temperature, &v) == LV_RESULT_INVALID) {
+ *     // v holds the rounded value, but the Subject was not a whole number
+ * }
+ * ```
+ *
+ * @param subject   pointer to a Subject of type `LV_SUBJECT_TYPE_INT` or
+ *                  `LV_SUBJECT_TYPE_FLOAT`
+ * @param value     where to store the value @nonnull
+ * @return          `LV_RESULT_OK` if the value survived the conversion,
+ *                  `LV_RESULT_INVALID` if a float Subject's value was not a whole number
+ *
+ * @note The answer does not depend on the rounding mode: the mode decides which integer
+ *       you get, this says whether that integer is the whole story.
+ */
+lv_result_t lv_subject_get_int_checked(lv_subject_t * subject, int32_t * value);
+
+#if LV_USE_FLOAT
+/**
+ * Read a Subject as a `float`, and be told whether anything was lost.
+ *
+ * See @ref lv_subject_get_int_checked. A `float` Subject always converts exactly. An
+ * `int` Subject does too, until its value passes
+ * @ref LV_SUBJECT_INT_EXACT_IN_FLOAT.
+ *
+ * @param subject   pointer to a Subject of type `LV_SUBJECT_TYPE_INT` or
+ *                  `LV_SUBJECT_TYPE_FLOAT`
+ * @param value     where to store the value @nonnull
+ * @return          `LV_RESULT_OK` if the value survived the conversion,
+ *                  `LV_RESULT_INVALID` if an int Subject's value was too large for a
+ *                  float to hold exactly
+ */
+lv_result_t lv_subject_get_float_checked(lv_subject_t * subject, float * value);
+#endif
+
+#if LV_USE_FLOAT
+/**
+ * Round a float Subject's value for a widget that takes an integer.
+ *
+ * Truncating would show 4.9 as 4, which matters when a float Subject exists precisely so
+ * the arithmetic behind it keeps its precision while the widget shows whole numbers.
+ *
+ * @param value   the value to round
+ * @return        the nearest integer
+ */
+static inline int32_t lv_subject_float_to_int(float value)
+{
+    return (int32_t)(value + (value >= 0.0f ? 0.5f : -0.5f));
+}
+#endif
+
+/**
+ * Make a computed integer Subject writable, by giving it a way to invert its mapper.
+ *
+ * Without a setter, `lv_subject_set_int()` on a Subject that has a mapper is rejected:
+ * its value belongs to the mapper. A setter turns the write into writes on the Subjects
+ * the mapper reads.
+ *
+ * ```c
+ * static bool celsius_setter(lv_subject_t * s, void * ud, int32_t value)
+ * {
+ *     lv_subject_set_int(&temp_k, value + 273);   // and temp_k's own setter runs
+ *     return true;
+ * }
+ * ```
+ *
+ * @param subject     pointer to an integer Subject that has a mapper
+ * @param setter      the callback, or NULL to make the Subject read-only again
+ * @param user_data   passed to `setter`
+ */
+void lv_subject_set_int_setter(lv_subject_t * subject, lv_subject_int_setter_t setter, void * user_data);
+
+#if LV_USE_FLOAT
+/** Make a computed float Subject writable. See @ref lv_subject_set_int_setter. */
+void lv_subject_set_float_setter(lv_subject_t * subject, lv_subject_float_setter_t setter, void * user_data);
+#endif
+
+/** Make a computed color Subject writable. See @ref lv_subject_set_int_setter. */
+void lv_subject_set_color_setter(lv_subject_t * subject, lv_subject_color_setter_t setter, void * user_data);
+
+/** Make a computed pointer Subject writable. See @ref lv_subject_set_int_setter. */
+void lv_subject_set_pointer_setter(lv_subject_t * subject, lv_subject_pointer_setter_t setter, void * user_data);
+
+/** Make a computed string Subject writable. See @ref lv_subject_set_int_setter. */
+void lv_subject_set_string_setter(lv_subject_t * subject, lv_subject_string_setter_t setter, void * user_data);
+
+/**
+ * Is this Subject writable?
+ *
+ * True for a plain Subject, and for a computed one that has a setter. False for a
+ * computed Subject without one, whose value belongs to its mapper.
+ *
+ * @param subject   pointer to a Subject
+ * @return          whether `lv_subject_set_...()` would be accepted
+ */
+bool lv_subject_is_writable(const lv_subject_t * subject);
+
+/**
+ * Declare every Subject this one's mapper or setter could touch, on any branch.
+ *
+ * The dependency edges LVGL wires up on its own are the ones a mapper *actually* read
+ * last time it ran, which is what makes a branch that was not taken not fire. They are
+ * the wrong thing to base lifetime on: with
+ *
+ * ```c
+ * shown = use_metric ? celsius : fahrenheit
+ * ```
+ *
+ * and `use_metric` true, nothing refers to `fahrenheit`, so deleting it succeeds — and
+ * flipping `use_metric` then reads freed memory.
+ *
+ * This declares the edges that do not change. A Subject named here cannot be deleted
+ * while this Subject is alive. Include the Subjects a setter *writes* as well as the ones
+ * a mapper reads: a setter's targets have to outlive it just the same.
+ *
+ * The XML exporter emits this, because it can see every branch of an expression. A
+ * hand-written mapper has to call it, or the Subjects it reads stay deletable.
+ *
+ * ```c
+ * static lv_subject_t * const shown_deps[] = { &use_metric, &celsius, &fahrenheit };
+ * lv_subject_set_static_deps(&shown, shown_deps, 3);
+ * ```
+ *
+ * @param subject   pointer to a Subject
+ * @param deps      array of Subjects, **not copied**, so it must outlive `subject`.
+ *                  NULL clears the declaration.
+ * @param count     entries in `deps`
+ *
+ * @note With `LV_USE_ASSERT_OBSERVER`, reading a Subject that is not in the list is
+ *       caught while the mapper runs. That is the same bug arriving by another route.
+ */
+void lv_subject_set_static_deps(lv_subject_t * subject, lv_subject_t * const * deps, uint32_t count);
+
+/**
+ * Change the bounds of a Subject made with @ref lv_subject_create_clamped.
+ *
+ * The bounds used to arrive as a write, which is why a clamped Subject accepted a
+ * pointer whatever its value type was. They are the mapper's own configuration, not a
+ * value anyone observes, so they are set directly instead.
+ *
+ * The Subject re-evaluates and notifies if the clamped result changed.
+ *
+ * @param subject   pointer to a clamped Subject
+ * @param range     the new bounds, copied out, so it may be transient
+ */
+void lv_subject_set_range(lv_subject_t * subject, const lv_subject_range_t * range);
 
 /**
  * Set the value of a pointer Subject, keeping ownership of the data.
@@ -1086,36 +1468,7 @@ void lv_subject_set_string_owned(lv_subject_t * subject, char * str, lv_subject_
  */
 bool lv_subject_is_value_owned(const lv_subject_t * subject);
 
-/**
- * Create a Subject that holds the smallest value another Subject has taken so far.
- *
- * The returned Subject has the same type as `source` and depends on it, so it updates
- * whenever `source` changes and never goes back up. Use it for a running minimum, e.g.
- * the lowest temperature seen since boot.
- *
- * @param source        the Subject to watch
- * @param compare_cb    how to order two values. @nullable Pass NULL to use the natural
- *                      ordering, which is available for `LV_SUBJECT_TYPE_INT`,
- *                      `LV_SUBJECT_TYPE_FLOAT` and `LV_SUBJECT_TYPE_COLOR`. A pointer
- *                      or string Subject has no natural ordering, so it needs one.
- * @return              the new Subject, or NULL on failure
- * @note                The returned Subject is `LV_SUBJECT_MODE_EAGER`, so it records
- *                      every value `source` passes through rather than only the ones
- *                      somebody happened to read. A lazy running extremum would miss
- *                      values, which is why this is not configurable.
- * @note                The helper owns the returned Subject's user data. Do not call
- *                      `lv_subject_set_user_data()` on it.
- */
-lv_subject_t * lv_subject_create_min(lv_subject_t * source, lv_subject_compare_cb_t compare_cb);
 
-/**
- * Create a Subject that holds the largest value another Subject has taken so far.
- * See @ref lv_subject_create_min.
- * @param source        the Subject to watch
- * @param compare_cb    how to order two values @nullable
- * @return              the new Subject, or NULL on failure
- */
-lv_subject_t * lv_subject_create_max(lv_subject_t * source, lv_subject_compare_cb_t compare_cb);
 
 /**
  * Create a Subject that mirrors another one, bounded to a range.

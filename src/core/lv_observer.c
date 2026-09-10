@@ -20,6 +20,30 @@
 
 
 #define subject_list LV_GLOBAL_DEFAULT()->subject_ll
+#define txn_writes LV_GLOBAL_DEFAULT()->subject_txn_writes
+
+/* How deep a chain of Observers writing Subjects may go before it is cut. */
+#define LV_SUBJECT_MAX_NOTIFY_DEPTH 8
+
+/* One entry of a transaction's write set: what a Subject held before the transaction
+ * first changed it. Recorded once per Subject per transaction, so it is the state to go
+ * back to if a setter fails. */
+typedef struct {
+    lv_subject_t * subject;
+    lv_subject_value_t old_value;
+    uint32_t old_version;
+    uint32_t old_changed_at;
+    uint8_t restorable;      /**< Can the value itself be put back? */
+    uint8_t old_owned;       /**< Did the Subject own `old_value`? Its release waits for the
+                              *   commit, because freeing cannot be undone. */
+    uint8_t direct;          /**< Written by a setter, rather than recomputed */
+    uint8_t old_pending;     /**< Was a notification already owed before the transaction?
+                              *   A rollback queues none of its own, but must not swallow
+                              *   one that was outstanding. */
+    lv_subject_value_t direct_value;
+    void * snapshot;         /**< A copying Subject's bytes before the transaction @nullable */
+    size_t snapshot_len;
+} txn_write_t;
 
 /**********************
  *      TYPEDEFS
@@ -130,6 +154,18 @@ static void flush_timer_update(void);
 /* Evaluation */
 static bool subject_is_eager_now(const lv_subject_t * subject);
 static bool write_allowed(void);
+
+/* Transactions */
+static void txn_enter(void);
+static void txn_leave(void);
+static void txn_record_change(lv_subject_t * subject);
+static void txn_abort(void);
+static bool txn_setter_write_ok(lv_subject_t * subject, lv_subject_value_t v);
+static bool run_setter(lv_subject_t * subject, lv_subject_value_t value);
+static bool mapped_write(lv_subject_t * subject, lv_subject_value_t value);
+static bool copy_write_handled(lv_subject_t * subject, const void * data, bool * ok);
+static bool static_deps_contain(const lv_subject_t * subject, const lv_subject_t * dep);
+static void static_deps_release(lv_subject_t * subject);
 /* Release a pointer, but only if the Subject owns it and nothing refers to it any more.
  *
  * A Subject refers to a pointer from two places: the value it stores and the input it
@@ -140,26 +176,23 @@ static void release_if_unreferenced(lv_subject_t * subject, void * p, bool owned
 {
     if(p == NULL || !owned) return;
     if(p == subject->value.pointer) return;
-    if(p == subject->last_input.pointer) return;
 
     if(subject->value_free_cb) subject->value_free_cb(p);
     else lv_free(p);
 }
 
-static bool input_convertible(const lv_subject_t * subject);
 static void set_pointer_value(lv_subject_t * subject, const void * ptr, bool owned,
                               lv_subject_value_free_cb_t free_cb);
 static bool buf_reserve(lv_subject_t * subject, size_t needed, bool warn);
 static void buf_release(lv_subject_t * subject);
 static size_t buf_capacity(const lv_subject_t * subject);
 static void release_if_unreferenced(lv_subject_t * subject, void * p, bool owned);
-static bool apply_input(lv_subject_t * subject, const void * borrowed_input);
-static bool run_mapper(lv_subject_t * subject, const void * borrowed_input);
-static bool can_defer_mapper(const lv_subject_t * subject);
-static void subject_input_written(lv_subject_t * subject, const void * borrowed_input,
-                                  void * superseded_input, bool superseded_input_owned);
-static void subject_commit_input(lv_subject_t * subject, const void * borrowed_input,
-                                 void * superseded_input, bool superseded_input_owned);
+static bool store_written(lv_subject_t * subject, lv_subject_value_t v, const void * str);
+static bool run_mapper(lv_subject_t * subject);
+static void publish(lv_subject_t * subject, bool changed);
+static void subject_evaluate(lv_subject_t * subject);
+static void subject_write(lv_subject_t * subject, lv_subject_value_t v, const void * str,
+                          bool owned, void * superseded, bool superseded_owned);
 static bool deps_are_unchanged(lv_subject_t * subject);
 static void subject_recompute(lv_subject_t * subject);
 static void subject_pull(lv_subject_t * subject);
@@ -170,9 +203,7 @@ static bool set_mapper_allowed(lv_subject_t * subject, lv_subject_type_t type);
 /* Derived-subject helpers */
 static int natural_compare(lv_subject_t * subject, lv_subject_value_t a, lv_subject_value_t b);
 static lv_subject_value_t read_source(lv_subject_t * source);
-static bool extremum_step(lv_subject_t * subject, void * user_data, lv_subject_value_t * value);
-static bool clamp_step(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                       lv_subject_value_t * value);
+static bool clamp_step(lv_subject_t * subject, void * user_data, lv_subject_value_t * value);
 static bool ordering_available(const lv_subject_t * source, lv_subject_compare_cb_t compare_cb);
 
 /* Observer mappers */
@@ -197,7 +228,11 @@ void lv_subject_global_init(void)
     global->subject_evaluating = NULL;
     global->subject_flush_timer = NULL;
     global->subject_flushing = 0;
+    global->subject_txn_depth = 0;
+    global->subject_txn_id = 0;
+    global->subject_txn_aborting = 0;
     lv_ll_init(&subject_list, sizeof(lv_subject_t));
+    lv_ll_init(&txn_writes, sizeof(txn_write_t));
 }
 void lv_subject_global_deinit(void)
 {
@@ -206,6 +241,8 @@ void lv_subject_global_deinit(void)
      * and has already destroyed every timer, so deleting it here would free it twice. */
     global->subject_flush_timer = NULL;
     global->subject_evaluating = NULL;
+    lv_ll_clear(&txn_writes);
+    global->subject_txn_depth = 0;
 
     /* Cascade from the head, one Subject at a time. A single cascade may take several
      * Subjects with it, which is exactly what is wanted here, and it means no ordering
@@ -229,6 +266,16 @@ void lv_subject_track_dependency(lv_subject_t * subject)
 {
     lv_subject_t * reader = LV_GLOBAL_DEFAULT()->subject_evaluating;
     if(reader == NULL || reader == subject) return;
+
+    /* A mapper reading something it never declared is the use-after-free arriving by
+     * another route: that Subject looks deletable to `lv_subject_delete()`. Only checked
+     * once a declaration exists, so a hand-written mapper that declares nothing is left
+     * alone. */
+    if(reader->static_deps != NULL && !static_deps_contain(reader, subject)) {
+        LV_LOG_WARN("A mapper read a Subject that is not in its static dependencies, so that "
+                    "Subject can still be deleted while this one needs it. Add it to the list "
+                    "passed to lv_subject_set_static_deps().");
+    }
 
     /* Already wired from an earlier read in the same evaluation? */
     if(ref_list_contains(&reader->deps, subject)) return;
@@ -322,6 +369,107 @@ void lv_subject_set_int_mapper(lv_subject_t * subject, lv_subject_int_mapper_t m
 }
 
 #if LV_USE_FLOAT
+/* A setter only means something on a Subject whose value its mapper owns. */
+static bool set_setter_allowed(lv_subject_t * subject, lv_subject_type_t type)
+{
+    LV_UNUSED(type);
+    LV_CHECK_ARG(subject != NULL, return false);
+    LV_CHECK_ARG(subject->type == type, return false);
+    if(!subject->has_mapper) {
+        LV_LOG_WARN("A setter is only useful on a Subject that has a mapper. A plain Subject "
+                    "is already writable.");
+        return false;
+    }
+    return true;
+}
+
+void lv_subject_set_int_setter(lv_subject_t * subject, lv_subject_int_setter_t setter, void * user_data)
+{
+    if(!set_setter_allowed(subject, LV_SUBJECT_TYPE_INT)) return;
+    subject->setter.int_cb = setter;
+    subject->setter_user_data = user_data;
+    subject->has_setter = setter != NULL;
+}
+
+#if LV_USE_FLOAT
+void lv_subject_set_float_setter(lv_subject_t * subject, lv_subject_float_setter_t setter, void * user_data)
+{
+    if(!set_setter_allowed(subject, LV_SUBJECT_TYPE_FLOAT)) return;
+    subject->setter.float_cb = setter;
+    subject->setter_user_data = user_data;
+    subject->has_setter = setter != NULL;
+}
+#endif
+
+void lv_subject_set_color_setter(lv_subject_t * subject, lv_subject_color_setter_t setter, void * user_data)
+{
+    if(!set_setter_allowed(subject, LV_SUBJECT_TYPE_COLOR)) return;
+    subject->setter.color_cb = setter;
+    subject->setter_user_data = user_data;
+    subject->has_setter = setter != NULL;
+}
+
+void lv_subject_set_pointer_setter(lv_subject_t * subject, lv_subject_pointer_setter_t setter,
+                                   void * user_data)
+{
+    if(!set_setter_allowed(subject, LV_SUBJECT_TYPE_POINTER)) return;
+    subject->setter.pointer_cb = setter;
+    subject->setter_user_data = user_data;
+    subject->has_setter = setter != NULL;
+}
+
+void lv_subject_set_string_setter(lv_subject_t * subject, lv_subject_string_setter_t setter,
+                                  void * user_data)
+{
+    if(!set_setter_allowed(subject, LV_SUBJECT_TYPE_STRING)) return;
+    subject->setter.string_cb = setter;
+    subject->setter_user_data = user_data;
+    subject->has_setter = setter != NULL;
+}
+
+bool lv_subject_is_writable(const lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return false);
+    return !subject->has_mapper || subject->has_setter;
+}
+
+/* Drop the references a Subject's static declaration holds on other Subjects. */
+static void static_deps_release(lv_subject_t * subject)
+{
+    for(uint32_t i = 0; i < subject->static_dep_cnt; i++) {
+        lv_subject_t * dep = subject->static_deps[i];
+        if(dep != NULL && dep->static_ref_cnt > 0) dep->static_ref_cnt--;
+    }
+    subject->static_deps = NULL;
+    subject->static_dep_cnt = 0;
+}
+
+/* Is `dep` one of the Subjects `subject` declared? */
+static bool static_deps_contain(const lv_subject_t * subject, const lv_subject_t * dep)
+{
+    for(uint32_t i = 0; i < subject->static_dep_cnt; i++) {
+        if(subject->static_deps[i] == dep) return true;
+    }
+    return false;
+}
+
+void lv_subject_set_static_deps(lv_subject_t * subject, lv_subject_t * const * deps, uint32_t count)
+{
+    LV_CHECK_ARG(subject != NULL, return);
+    LV_CHECK_ARG(deps != NULL || count == 0, return);
+
+    static_deps_release(subject);
+    if(deps == NULL || count == 0) return;
+
+    subject->static_deps = deps;
+    subject->static_dep_cnt = count;
+
+    /* Each named Subject now has a reason to stay alive. */
+    for(uint32_t i = 0; i < count; i++) {
+        if(deps[i] != NULL) deps[i]->static_ref_cnt++;
+    }
+}
+
 void lv_subject_set_float_mapper(lv_subject_t * subject, lv_subject_float_mapper_t mapper, void * user_data)
 {
     if(!set_mapper_allowed(subject, LV_SUBJECT_TYPE_FLOAT)) return;
@@ -382,6 +530,44 @@ bool lv_subject_is_value_owned(const lv_subject_t * subject)
     return subject->owns_value;
 }
 
+void lv_subject_transaction_begin(void)
+{
+    txn_enter();
+}
+
+lv_result_t lv_subject_transaction_commit(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+
+    if(global->subject_txn_depth == 0) {
+        /* A refusal already closed it and put every write back, so this is the normal
+         * end of a transaction that failed, not a misuse. */
+        if(global->subject_txn_aborted) return LV_RESULT_INVALID;
+
+        LV_LOG_WARN("lv_subject_transaction_commit() with no transaction open");
+        return LV_RESULT_INVALID;
+    }
+    txn_leave();
+    return LV_RESULT_OK;
+}
+
+uint32_t lv_subject_get_changed_at(lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return 0);
+
+    /* Reading a stamp is a read like any other: it wires a dependency, and it evaluates
+     * a dirty Subject first. A lazily computed Subject's stamp is stale until its mapper
+     * has run, so comparing without evaluating would give the wrong answer. */
+    lv_subject_track_dependency(subject);
+    subject_pull(subject);
+    return subject->changed_at;
+}
+
+uint32_t lv_subject_get_transaction_id(void)
+{
+    return LV_GLOBAL_DEFAULT()->subject_txn_id;
+}
+
 void lv_subject_flush(void)
 {
     process_dirty(true);
@@ -400,7 +586,7 @@ lv_subject_t * lv_subject_create(lv_subject_type_t type)
 
     init_common(subject);
     subject->in_list = 1;
-    subject->input_type = (uint32_t)type;
+    subject->type = (uint32_t)type;
 
     switch(type) {
         case LV_SUBJECT_TYPE_INT:
@@ -441,45 +627,34 @@ static void subject_destroy(lv_subject_t * subject)
     lv_free(subject);
 }
 
-lv_subject_t * lv_subject_create_mapped(lv_subject_type_t input_type, lv_subject_type_t value_type)
-{
-    LV_CHECK_ARG(input_type != LV_SUBJECT_TYPE_INVALID, return NULL);
-    LV_CHECK_ARG(value_type != LV_SUBJECT_TYPE_INVALID, return NULL);
-    LV_CHECK_ARG(LV_USE_FLOAT || (input_type != LV_SUBJECT_TYPE_FLOAT && value_type != LV_SUBJECT_TYPE_FLOAT),
-                 return NULL);
-    /* An LV_SUBJECT_TYPE_NONE Subject has no value, so there is nothing to convert to. */
-    LV_CHECK_ARG(value_type != LV_SUBJECT_TYPE_NONE, return NULL);
-
-    lv_subject_t * subject = lv_subject_create(value_type);
-    if(subject == NULL) return NULL;
-
-    subject->input_type = (uint32_t)input_type;
-    return subject;
-}
-
-lv_subject_type_t lv_subject_get_input_type(const lv_subject_t * subject)
-{
-    LV_CHECK_ARG(subject != NULL, return LV_SUBJECT_TYPE_INVALID);
-    return (lv_subject_type_t)subject->input_type;
-}
-
-void lv_subject_delete(lv_subject_t * subject)
+lv_result_t lv_subject_delete(lv_subject_t * subject)
 {
     if(!subject) {
-        return;
+        return LV_RESULT_INVALID;
     }
     if(!subject->in_list) {
         LV_LOG_WARN("Use lv_subject_deinit() for a Subject set up with lv_subject_init_...()");
-        return;
+        return LV_RESULT_INVALID;
     }
+    /* The declared edges first. They cover every branch, so they catch the Subject that
+     * happens to be unread right now but would be read after a condition flips. */
+    if(subject->static_ref_cnt > 0) {
+        LV_LOG_WARN("Subject is named in the static dependencies of %" LV_PRIu32 " other "
+                    "Subject(s), so deleting it could leave a mapper or setter reaching freed "
+                    "memory. Delete those first, or use lv_subject_delete_cascade().",
+                    subject->static_ref_cnt);
+        return LV_RESULT_INVALID;
+    }
+
     uint32_t dependents = ref_list_count(&subject->dependents);
     if(dependents > 0) {
         LV_LOG_WARN("Subject is a dependency of %" LV_PRIu32 " other Subject(s). Delete those "
                     "first, or use lv_subject_delete_cascade().", dependents);
-        return;
+        return LV_RESULT_INVALID;
     }
 
     subject_destroy(subject);
+    return LV_RESULT_OK;
 }
 
 void lv_subject_set_delete_cb(lv_subject_t * subject, lv_subject_delete_cb_t cb, void * user_data)
@@ -547,34 +722,219 @@ void lv_subject_init_int(lv_subject_t * subject, int32_t value)
     init_int(subject, value);
 }
 
+void lv_subject_set_rounding(lv_subject_t * subject, lv_subject_rounding_t rounding)
+{
+    LV_CHECK_ARG(subject != NULL, return);
+
+    subject->rounding = rounding;
+}
+
+#if LV_USE_FLOAT
+/* Is the float a whole number, and which one is it nearest?
+ *
+ * The tolerance is scaled by magnitude rather than fixed: a float near 1e6 cannot hold a
+ * fraction finer than about 0.06, so a fixed one would call a value broken that is as
+ * whole as a float can be. The constant is FLT_EPSILON, spelled out rather than pulling
+ * in <float.h>. */
+static bool float_is_whole(float value, int32_t * nearest)
+{
+    int32_t n = lv_subject_float_to_int(value);
+    if(nearest != NULL) *nearest = n;
+
+    float mag = value < 0.0f ? -value : value;
+    float tol = 4.0f * 1.19209290e-7f * mag;
+    if(tol < 1e-6f) tol = 1e-6f;
+
+    float diff = value - (float)n;
+    if(diff < 0.0f) diff = -diff;
+    return diff <= tol;
+}
+
+/* A float turned into an int, the way this Subject asks for. The only place that decides,
+ * so a read and a write cannot disagree. `lossless` reports whether the fraction was
+ * there to lose; passing NULL asks for the warning instead. */
+static int32_t float_as_int(const lv_subject_t * subject, float value, bool * lossless)
+{
+    int32_t nearest;
+    bool whole = float_is_whole(value, &nearest);
+    if(lossless != NULL) *lossless = whole;
+
+    if(!whole && lossless == NULL && subject->rounding == LV_SUBJECT_ROUND_EXACT) {
+        LV_LOG_WARN("This Subject is set to LV_SUBJECT_ROUND_EXACT but its value is not "
+                    "a whole number. Rounded to %" LV_PRId32 ". Use "
+                    "lv_subject_get_int_checked() to be told instead of warned, or "
+                    "choose LV_SUBJECT_ROUND_NEAREST or LV_SUBJECT_ROUND_TOWARD_ZERO.",
+                    nearest);
+    }
+
+    if(subject->rounding == LV_SUBJECT_ROUND_TOWARD_ZERO) return (int32_t)value;
+    return nearest;
+}
+
+/* An int turned into a float. Exact until the mantissa runs out. */
+static bool int_fits_float(int32_t value)
+{
+    return value >= -LV_SUBJECT_INT_EXACT_IN_FLOAT && value <= LV_SUBJECT_INT_EXACT_IN_FLOAT;
+}
+#endif
+
 void lv_subject_set_int(lv_subject_t * subject, int32_t value)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_INT, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT,
+                 return);
+
+#if LV_USE_FLOAT
+    if(subject->type == LV_SUBJECT_TYPE_FLOAT) {
+        /* Exact up to 2^24, and above it a float starts dropping low bits. Only
+         * LV_SUBJECT_ROUND_EXACT treats that as a reason not to store the value. */
+        if(subject->rounding == LV_SUBJECT_ROUND_EXACT && !int_fits_float(value)) {
+            LV_LOG_WARN("%" LV_PRId32 " is too large for a float to hold exactly, and this "
+                        "Subject is set to LV_SUBJECT_ROUND_EXACT, so the write is refused "
+                        "and the previous value is kept.", value);
+            return;
+        }
+        lv_subject_set_float(subject, (float)value);
+        return;
+    }
+#endif
 
     if(!write_allowed()) return;
-    if(!input_convertible(subject)) return;
 
-    /* Record the input, then let the mapper decide what gets stored. A mapper that
-     * ignores `input` and derives from its dependencies discards it. */
-    subject->last_input.num = value;
-    subject_input_written(subject, NULL, NULL, false);
+    if(subject->has_mapper) {
+        lv_subject_value_t v = { .num = value };
+        mapped_write(subject, v);
+        return;
+    }
+
+
+    lv_subject_value_t v = { .num = value };
+    subject_write(subject, v, NULL, false, NULL, false);
+}
+
+/*---------------------------------------------------------------
+ * Peeking
+ *
+ * The same value, without the read counting as a dependency. A mapper that peeks decides
+ * for itself what it depends on, with `lv_subject_track_dependency()`, instead of
+ * depending on whatever its control flow happened to touch.
+ *
+ * The value is still brought up to date first: peeking a stale Subject would otherwise
+ * answer with the previous evaluation's result.
+ *--------------------------------------------------------------*/
+
+int32_t lv_subject_peek_int(lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return 0);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT,
+                 return 0);
+
+    subject_pull(subject);
+#if LV_USE_FLOAT
+    if(subject->type == LV_SUBJECT_TYPE_FLOAT) return float_as_int(subject, subject->value.float_v, NULL);
+#endif
+    return subject->value.num;
+}
+
+#if LV_USE_FLOAT
+float lv_subject_peek_float(lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return 0.0f);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_FLOAT || subject->type == LV_SUBJECT_TYPE_INT,
+                 return 0.0f);
+
+    subject_pull(subject);
+    if(subject->type == LV_SUBJECT_TYPE_INT) return (float)subject->value.num;
+    return subject->value.float_v;
+}
+#endif
+
+lv_color_t lv_subject_peek_color(lv_subject_t * subject)
+{
+    lv_color_t black = lv_color_black();
+    LV_CHECK_ARG(subject != NULL, return black);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_COLOR, return black);
+
+    subject_pull(subject);
+    return subject->value.color;
+}
+
+const char * lv_subject_peek_string(lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return NULL);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return NULL);
+
+    subject_pull(subject);
+    return subject->value.pointer;
+}
+
+const void * lv_subject_peek_pointer(lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return NULL);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_POINTER, return NULL);
+
+    subject_pull(subject);
+    return subject->value.pointer;
 }
 
 int32_t lv_subject_get_int(lv_subject_t * subject)
 {
     LV_CHECK_ARG(subject != NULL, return 0);
-    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT, return 0);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT,
+                 return 0);
 
+    /* The dependency is on the Subject, whichever type it was read as. */
     lv_subject_track_dependency(subject);
     subject_pull(subject);
+#if LV_USE_FLOAT
+    if(subject->type == LV_SUBJECT_TYPE_FLOAT) return float_as_int(subject, subject->value.float_v, NULL);
+#endif
     return subject->value.num;
 }
 
 
 
 
+lv_result_t lv_subject_get_int_checked(lv_subject_t * subject, int32_t * value)
+{
+    LV_CHECK_ARG(subject != NULL, return LV_RESULT_INVALID);
+    LV_CHECK_ARG(value != NULL, return LV_RESULT_INVALID);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT,
+                 return LV_RESULT_INVALID);
+
+    lv_subject_track_dependency(subject);
+    subject_pull(subject);
+
 #if LV_USE_FLOAT
+    if(subject->type == LV_SUBJECT_TYPE_FLOAT) {
+        bool lossless;
+        *value = float_as_int(subject, subject->value.float_v, &lossless);
+        return lossless ? LV_RESULT_OK : LV_RESULT_INVALID;
+    }
+#endif
+    *value = subject->value.num;
+    return LV_RESULT_OK;
+}
+
+#if LV_USE_FLOAT
+
+lv_result_t lv_subject_get_float_checked(lv_subject_t * subject, float * value)
+{
+    LV_CHECK_ARG(subject != NULL, return LV_RESULT_INVALID);
+    LV_CHECK_ARG(value != NULL, return LV_RESULT_INVALID);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_FLOAT || subject->type == LV_SUBJECT_TYPE_INT,
+                 return LV_RESULT_INVALID);
+
+    lv_subject_track_dependency(subject);
+    subject_pull(subject);
+
+    if(subject->type == LV_SUBJECT_TYPE_INT) {
+        *value = (float)subject->value.num;
+        return int_fits_float(subject->value.num) ? LV_RESULT_OK : LV_RESULT_INVALID;
+    }
+    *value = subject->value.float_v;
+    return LV_RESULT_OK;
+}
 
 void lv_subject_init_float(lv_subject_t * subject, float value)
 {
@@ -587,22 +947,48 @@ void lv_subject_init_float(lv_subject_t * subject, float value)
 void lv_subject_set_float(lv_subject_t * subject, float value)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_FLOAT, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_FLOAT || subject->type == LV_SUBJECT_TYPE_INT,
+                 return);
+
+    /* An int Subject keeps only the whole part, by its own rounding rule. */
+    if(subject->type == LV_SUBJECT_TYPE_INT) {
+        bool lossless;
+        int32_t as_int = float_as_int(subject, value, &lossless);
+        if(!lossless && subject->rounding == LV_SUBJECT_ROUND_EXACT) {
+            LV_LOG_WARN("This Subject is set to LV_SUBJECT_ROUND_EXACT and the value "
+                        "written is not a whole number, so the write is refused and the "
+                        "previous value is kept. It would have stored %" LV_PRId32 ".",
+                        as_int);
+            return;
+        }
+        lv_subject_set_int(subject, as_int);
+        return;
+    }
 
     if(!write_allowed()) return;
-    if(!input_convertible(subject)) return;
 
-    subject->last_input.float_v = value;
-    subject_input_written(subject, NULL, NULL, false);
+    if(subject->has_mapper) {
+        lv_subject_value_t v = { .float_v = value };
+        mapped_write(subject, v);
+        return;
+    }
+
+
+    lv_subject_value_t written = { .float_v = value };
+    subject_write(subject, written, NULL, false, NULL, false);
 }
 
 float lv_subject_get_float(lv_subject_t * subject)
 {
     LV_CHECK_ARG(subject != NULL, return 0.0);
-    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_FLOAT, return 0.0);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_FLOAT || subject->type == LV_SUBJECT_TYPE_INT,
+                 return 0.0);
 
+    /* The dependency is on the Subject, whichever type it was read as. */
     lv_subject_track_dependency(subject);
     subject_pull(subject);
+    /* Exact, so there is nothing for the rounding rule to decide. */
+    if(subject->type == LV_SUBJECT_TYPE_INT) return (float)subject->value.num;
     return subject->value.float_v;
 }
 
@@ -648,7 +1034,6 @@ void lv_subject_set_buffer(lv_subject_t * subject, void * buf, size_t size,
 
     /* A copying Subject never owns its value separately: the buffer is the value. */
     subject->owns_value = 0;
-    subject->owns_input = 0;
 
     if(buf != NULL && size > 0 && subject->type == LV_SUBJECT_TYPE_STRING) {
         ((char *)buf)[0] = '\0';
@@ -668,10 +1053,12 @@ void lv_subject_set_string_buffer_static(lv_subject_t * subject, char * buf, siz
 bool lv_subject_copy_pointer(lv_subject_t * subject, const void * data, size_t size)
 {
     LV_CHECK_ARG(subject != NULL, return false);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_POINTER, return false);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_POINTER, return false);
     LV_CHECK_ARG(data != NULL || size == 0, return false);
     if(!write_allowed()) return false;
-    if(!input_convertible(subject)) return false;
+
+    bool handled_ok = false;
+    if(copy_write_handled(subject, data, &handled_ok)) return handled_ok;
 
     if(!buf_reserve(subject, size, true)) return false;
 
@@ -685,8 +1072,8 @@ bool lv_subject_copy_pointer(lv_subject_t * subject, const void * data, size_t s
     b->length = size;
 
     subject->value.pointer = b->buf;
-    subject->last_input.pointer = b->buf;
-    subject_commit_input(subject, b->buf, NULL, false);
+    lv_subject_value_t v = { .pointer = b->buf };
+    subject_write(subject, v, NULL, false, NULL, false);
     return true;
 }
 
@@ -699,10 +1086,12 @@ size_t lv_subject_get_pointer_size(const lv_subject_t * subject)
 bool lv_subject_copy_string(lv_subject_t * subject, const char * buf)
 {
     LV_CHECK_ARG(subject != NULL, return false);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_STRING, return false);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return false);
     LV_CHECK_ARG(buf != NULL, return false);
     if(!write_allowed()) return false;
-    if(!input_convertible(subject)) return false;
+
+    bool handled_ok = false;
+    if(copy_write_handled(subject, buf, &handled_ok)) return handled_ok;
 
     size_t needed = lv_strlen(buf) + 1;
     if(!buf_reserve(subject, needed, true)) return false;
@@ -712,17 +1101,20 @@ bool lv_subject_copy_string(lv_subject_t * subject, const char * buf)
 
     /* The new string is handed to the mapper as `input`; the buffer still holds the
      * previous value, so a mapper can compare the two. */
-    subject_commit_input(subject, buf, NULL, false);
+    lv_subject_value_t v = { .pointer = buf };
+    subject_write(subject, v, buf, false, NULL, false);
     return true;
 }
 
 bool lv_subject_copy_string_trimmed(lv_subject_t * subject, const char * buf)
 {
     LV_CHECK_ARG(subject != NULL, return false);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_STRING, return false);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return false);
     LV_CHECK_ARG(buf != NULL, return false);
     if(!write_allowed()) return false;
-    if(!input_convertible(subject)) return false;
+
+    bool handled_ok = false;
+    if(copy_write_handled(subject, buf, &handled_ok)) return handled_ok;
 
     size_t needed = lv_strlen(buf) + 1;
     /* Quietly, because not fitting is the expected case here rather than a problem. */
@@ -747,17 +1139,23 @@ bool lv_subject_copy_string_trimmed(lv_subject_t * subject, const char * buf)
                              lv_memcmp(current, buf, stored_len) != 0) ? 1U : 0U;
 
     /* `apply_input()` copies with lv_strlcpy(), which trims to the capacity. */
-    subject_commit_input(subject, buf, NULL, false);
+    lv_subject_value_t v = { .pointer = buf };
+    subject_write(subject, v, buf, false, NULL, false);
     return true;
 }
 
 bool lv_subject_snprintf(lv_subject_t * subject, const char * format, ...)
 {
     LV_CHECK_ARG(subject != NULL, return false);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_STRING, return false);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return false);
     LV_CHECK_ARG(format != NULL, return false);
     if(!write_allowed()) return false;
-    if(!input_convertible(subject)) return false;
+
+    if(subject->has_mapper) {
+        LV_LOG_WARN("lv_subject_snprintf() formats into the Subject's own buffer, which a "
+                    "mapper owns. Format into a local and pass that to the setter instead.");
+        return false;
+    }
 
     /* Measure first, so a growable buffer can be grown to fit instead of truncating. */
     va_list va;
@@ -782,7 +1180,8 @@ bool lv_subject_snprintf(lv_subject_t * subject, const char * format, ...)
     lv_subject_buf_t * b = subject->buf;
     subject->copy_changed = lv_strcmp((const char *)b->buf, tmp) != 0 ? 1U : 0U;
 
-    subject_commit_input(subject, tmp, NULL, false);
+    lv_subject_value_t v = { .pointer = tmp };
+    subject_write(subject, v, tmp, false, NULL, false);
     lv_free(tmp);
     return true;
 }
@@ -812,25 +1211,23 @@ static void set_pointer_value(lv_subject_t * subject, const void * ptr, bool own
                               lv_subject_value_free_cb_t free_cb)
 {
     if(!write_allowed()) return;
-    if(!input_convertible(subject)) return;
 
-    /* The input this one supersedes may be the Subject's to release, and it carries its
-     * own ownership: a borrowed write followed by an owned one, or the reverse, both
-     * have to do the right thing. */
-    void * superseded_input = (void *)subject->last_input.pointer;
-    bool superseded_input_owned = subject->owns_input;
+    if(subject->has_mapper) {
+        lv_subject_value_t v = { .pointer = ptr };
+        mapped_write(subject, v);
+        return;
+    }
 
-    subject->last_input.pointer = ptr;
-    subject->owns_input = owned ? 1U : 0U;
     if(owned) subject->value_free_cb = free_cb;
 
-    subject_input_written(subject, ptr, superseded_input, superseded_input_owned);
+    lv_subject_value_t v = { .pointer = ptr };
+    subject_write(subject, v, NULL, owned, NULL, false);
 }
 
 void lv_subject_set_pointer(lv_subject_t * subject, void * ptr)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_POINTER, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_POINTER, return);
 
     set_pointer_value(subject, ptr, false, NULL);
 }
@@ -838,7 +1235,7 @@ void lv_subject_set_pointer(lv_subject_t * subject, void * ptr)
 void lv_subject_set_pointer_owned(lv_subject_t * subject, void * ptr, lv_subject_value_free_cb_t free_cb)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_POINTER, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_POINTER, return);
 
     set_pointer_value(subject, ptr, true, free_cb);
 }
@@ -846,7 +1243,7 @@ void lv_subject_set_pointer_owned(lv_subject_t * subject, void * ptr, lv_subject
 void lv_subject_set_string(lv_subject_t * subject, const char * str)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_STRING, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return);
     if(subject->buf != NULL) {
         LV_LOG_WARN("This string Subject has a buffer, so it copies. Use lv_subject_copy_string(), "
                     "or create one without a buffer to store a pointer instead.");
@@ -859,7 +1256,7 @@ void lv_subject_set_string(lv_subject_t * subject, const char * str)
 void lv_subject_set_string_owned(lv_subject_t * subject, char * str, lv_subject_value_free_cb_t free_cb)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_STRING, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return);
     if(subject->buf != NULL) {
         LV_LOG_WARN("This string Subject has a buffer, so it copies. Use lv_subject_copy_string(), "
                     "or create one without a buffer to take ownership of a string instead.");
@@ -891,13 +1288,19 @@ void lv_subject_init_color(lv_subject_t * subject, lv_color_t color)
 void lv_subject_set_color(lv_subject_t * subject, lv_color_t color)
 {
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_COLOR, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_COLOR, return);
 
     if(!write_allowed()) return;
-    if(!input_convertible(subject)) return;
 
-    subject->last_input.color = color;
-    subject_input_written(subject, NULL, NULL, false);
+    if(subject->has_mapper) {
+        lv_subject_value_t v = { .color = color };
+        mapped_write(subject, v);
+        return;
+    }
+
+
+    lv_subject_value_t written = { .color = color };
+    subject_write(subject, written, NULL, false, NULL, false);
 }
 
 lv_color_t lv_subject_get_color(lv_subject_t * subject)
@@ -1054,7 +1457,7 @@ lv_subject_increment_dsc_t * lv_obj_add_subject_increment_event(lv_obj_t * obj, 
     LV_CHECK_ARG(subject != NULL, return NULL);
     LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT, return NULL);
     /* It reads the value and writes it back, so both sides have to match. */
-    LV_CHECK_ARG(subject->input_type == subject->type, return NULL);
+    LV_CHECK_ARG(true, return NULL);
 
     lv_subject_increment_dsc_t * user_data = lv_malloc(sizeof(lv_subject_increment_dsc_t));
     if(user_data == NULL) {
@@ -1131,7 +1534,7 @@ void lv_obj_add_subject_toggle_event(lv_obj_t * obj, lv_subject_t * subject, lv_
     LV_CHECK_ARG(subject != NULL, return);
     LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT, return);
     /* It reads the value and writes it back, so both sides have to be an integer. */
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_INT, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT, return);
 
     lv_obj_add_event_cb(obj, subject_toggle_cb, trigger, subject);
 }
@@ -1140,7 +1543,7 @@ void lv_obj_add_subject_set_int_event(lv_obj_t * obj, lv_subject_t * subject, lv
 {
     LV_CHECK_ARG(obj != NULL, return);
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_INT, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_INT, return);
 
     subject_set_int_user_data_t * user_data = lv_malloc(sizeof(subject_set_int_user_data_t));
     if(user_data == NULL) {
@@ -1161,7 +1564,7 @@ void lv_obj_add_subject_set_float_event(lv_obj_t * obj, lv_subject_t * subject, 
 {
     LV_CHECK_ARG(obj != NULL, return);
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_FLOAT, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_FLOAT, return);
 
     subject_set_float_user_data_t * user_data = lv_malloc(sizeof(subject_set_float_user_data_t));
     if(user_data == NULL) {
@@ -1183,7 +1586,7 @@ void lv_obj_add_subject_set_string_event(lv_obj_t * obj, lv_subject_t * subject,
 {
     LV_CHECK_ARG(obj != NULL, return);
     LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(subject->input_type == LV_SUBJECT_TYPE_STRING, return);
+    LV_CHECK_ARG(subject->type == LV_SUBJECT_TYPE_STRING, return);
     LV_CHECK_ARG(value != NULL, return);
 
     subject_set_string_user_data_t * user_data = lv_malloc(sizeof(subject_set_string_user_data_t));
@@ -1749,6 +2152,14 @@ static void mark_dirty(lv_subject_t * subject)
 
 static void mark_pending_notify(lv_subject_t * subject)
 {
+    if(!subject->in_list) {
+        /* An application-owned Subject is not in the global list, so no drain can ever
+         * find it. It is notified here instead. Such a Subject sits outside the graph
+         * bookkeeping altogether, which is why `lv_subject_init_...()` is deprecated. */
+        notify(subject);
+        return;
+    }
+
     subject->pending_notify = 1;
     list_reposition(subject);
     flush_timer_update();
@@ -1785,8 +2196,19 @@ static void mark_dependents_dirty(lv_subject_t * subject)
 static void process_dirty(bool include_observed)
 {
     lv_global_t * global = LV_GLOBAL_DEFAULT();
-    if(global->subject_flushing) return;  /* the outermost call owns the loop */
-    global->subject_flushing = 1;
+
+    /* Re-entrant on purpose. An Observer may write a Subject, and that write is its own
+     * transaction: it has to evaluate and notify before the Observer's next statement,
+     * or two writes in a row would look like one. The cap is there because a chain of
+     * Observers writing each other has nothing else to stop it. */
+    if(global->subject_flushing >= LV_SUBJECT_MAX_NOTIFY_DEPTH) {
+        LV_LOG_WARN("Observers are writing Subjects more than %d deep. The chain is cut "
+                    "here. An Observer that writes is starting a new transaction, so a "
+                    "cycle between two of them never settles.",
+                    (int)LV_SUBJECT_MAX_NOTIFY_DEPTH);
+        return;
+    }
+    global->subject_flushing++;
 
     /* No round cap is needed: a mapper may not write a Subject, so an evaluation cannot
      * re-dirty anything, and the dirty set only ever shrinks here. */
@@ -1814,7 +2236,7 @@ static void process_dirty(bool include_observed)
         }
     }
 
-    global->subject_flushing = 0;
+    global->subject_flushing--;
     flush_timer_update();
 }
 
@@ -1857,6 +2279,294 @@ static bool subject_is_eager_now(const lv_subject_t * subject)
     return subject->mode == 1U || subject->immediate_observer_cnt > 0;
 }
 
+/*---------------------------------------------------------------
+ * Transactions
+ *
+ * A transaction defers *notification*, not evaluation. Writes take effect as they are
+ * made, so a read inside a transaction is always honest and a chain of setters sees what
+ * the previous one wrote. The Observers hear one settled story at the commit.
+ *
+ * Every public write wraps itself in one of these, so a bare write is a transaction of
+ * its own and there is a single code path. Notification never happens inside a
+ * transaction: the commit at depth 0 evaluates what is due and then notifies, so an
+ * Observer always sees a settled graph, and a write an Observer makes is a new
+ * transaction rather than a nested one.
+ *--------------------------------------------------------------*/
+
+static void txn_enter(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    /* A fresh top-level transaction gets a new id. Every Subject it changes stamps that
+     * id, so Subjects changed together compare equal. */
+    if(global->subject_txn_depth == 0) {
+        global->subject_txn_id++;
+        /* The flag describes the transaction now starting, not the one before it. */
+        global->subject_txn_aborted = 0;
+    }
+    global->subject_txn_depth++;
+}
+
+static void txn_leave(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    if(global->subject_txn_depth == 0) return;
+
+    global->subject_txn_depth--;
+    if(global->subject_txn_depth > 0) return;   /* an inner commit notifies nothing */
+
+    /* Committed, so the values the transaction replaced are finally unreachable and the
+     * releases it held back can happen. */
+    txn_write_t * w;
+    LV_LL_READ(&txn_writes, w) {
+        lv_subject_t * subject = w->subject;
+        if(w->old_owned && (void *)subject->value.pointer != (void *)w->old_value.pointer) {
+            void * old = (void *)w->old_value.pointer;
+            if(old != NULL) {
+                if(subject->value_free_cb) subject->value_free_cb(old);
+                else lv_free(old);
+            }
+        }
+        if(w->snapshot != NULL) lv_free(w->snapshot);
+    }
+    lv_ll_clear(&txn_writes);
+
+    /* The graph has settled. Evaluate what is due and deliver the notifications that
+     * were held back. */
+    process_dirty(false);
+}
+
+static txn_write_t * txn_find(const lv_subject_t * subject)
+{
+    txn_write_t * w;
+    LV_LL_READ(&txn_writes, w) {
+        if(w->subject == subject) return w;
+    }
+    return NULL;
+}
+
+/* Remember what a Subject held before this transaction first changed it.
+ *
+ * Called just before every change, so the entry is the state a rollback goes back to.
+ * Only the first change per Subject is recorded: later ones are already covered. */
+static void txn_record_change(lv_subject_t * subject)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    if(global->subject_txn_depth == 0) return;   /* not inside anything to undo */
+    if(global->subject_txn_aborting) return;     /* the undo must not record itself */
+    if(txn_find(subject) != NULL) return;
+
+    txn_write_t * w = lv_ll_ins_tail(&txn_writes);
+    if(w == NULL) return;   /* out of memory: the rollback will be incomplete, not wrong */
+
+    w->subject = subject;
+    w->old_value = subject->value;
+    w->old_version = subject->version;
+    w->old_changed_at = subject->changed_at;
+    w->direct = 0;
+    w->direct_value = subject->value;
+    w->old_owned = subject->owns_value;
+    w->old_pending = subject->pending_notify;
+    w->snapshot = NULL;
+    w->snapshot_len = 0;
+    w->restorable = 1;
+
+    /* A copying Subject writes over its own buffer, so the only way back is a copy of
+     * the bytes. Everything else is either a value or a pointer, and both are already in
+     * `old_value`.
+     *
+     * Releasing an owned pointer is what a rollback genuinely cannot undo, so a write
+     * inside a transaction does not release: `old_value` keeps it alive until the commit
+     * decides which of the two to free. */
+    if(subject->buf != NULL && subject->buf->buf != NULL) {
+        size_t len = subject->buf->length;
+        if(subject->type == LV_SUBJECT_TYPE_STRING) len++;   /* the terminator too */
+        if(len > 0) {
+            w->snapshot = lv_malloc(len);
+            if(w->snapshot != NULL) {
+                lv_memcpy(w->snapshot, subject->buf->buf, len);
+                w->snapshot_len = len;
+            }
+        }
+        /* The buffer *is* the value, so there is no separate pointer to put back. */
+        w->restorable = 0;
+    }
+}
+
+/* Has a chain of setters come back around to a Subject it already wrote, with a
+ * different answer?
+ *
+ * Writing the same value again is how a chain settles, and change detection stops it on
+ * its own. A *different* value means the inverses disagree and the propagation would not
+ * terminate, so the transaction fails instead.
+ *
+ * Only checked while a setter is running. Outside one, writing the same Subject twice
+ * with different values is ordinary application code, not a cycle. */
+static bool txn_setter_write_ok(lv_subject_t * subject, lv_subject_value_t v)
+{
+    txn_write_t * w = txn_find(subject);
+    if(w == NULL) return true;
+
+    if(!w->direct) {
+        w->direct = 1;
+        w->direct_value = v;
+        return true;
+    }
+
+    bool same;
+    switch(subject->type) {
+        case LV_SUBJECT_TYPE_INT:
+            same = w->direct_value.num == v.num;
+            break;
+#if LV_USE_FLOAT
+        case LV_SUBJECT_TYPE_FLOAT:
+            same = w->direct_value.float_v == v.float_v;
+            break;
+#endif
+        case LV_SUBJECT_TYPE_COLOR:
+            same = lv_color_to_u32(w->direct_value.color) == lv_color_to_u32(v.color);
+            break;
+        default:
+            same = true;
+            break;
+    }
+    if(same) return true;
+
+    LV_LOG_WARN("A chain of setters wrote the same Subject twice with different values. "
+                "The inverses disagree, so the transaction is rolled back.");
+    return false;
+}
+
+/* Put back everything the transaction changed. */
+static void txn_abort(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    global->subject_txn_aborting = 1;
+
+    /* Newest first, so a Subject changed more than once ends at its oldest state. */
+    txn_write_t * w = lv_ll_get_tail(&txn_writes);
+    while(w != NULL) {
+        lv_subject_t * subject = w->subject;
+        void * current = (void *)subject->value.pointer;
+
+        /* The transaction is being undone, so anything it took ownership of goes with
+         * it: the caller already handed it over and nothing will refer to it again. */
+        if(subject->owns_value && current != NULL && current != (void *)w->old_value.pointer) {
+            if(subject->value_free_cb) subject->value_free_cb(current);
+            else lv_free(current);
+        }
+
+        if(w->restorable) subject->value = w->old_value;
+        subject->owns_value = w->old_owned;
+        subject->version = w->old_version;
+        subject->changed_at = w->old_changed_at;
+
+        /* A copying Subject's bytes are the value, so they are put back from the copy
+         * taken before the first write. */
+        if(w->snapshot != NULL && subject->buf != NULL && subject->buf->buf != NULL) {
+            if(w->snapshot_len <= subject->buf->capacity) {
+                lv_memcpy(subject->buf->buf, w->snapshot, w->snapshot_len);
+                subject->buf->length = subject->type == LV_SUBJECT_TYPE_STRING
+                                       ? w->snapshot_len - 1 : w->snapshot_len;
+            }
+            lv_free(w->snapshot);
+            w->snapshot = NULL;
+        }
+
+        /* The notification the write queued goes back with the value. Nothing changed
+         * after all, so an Observer must not be told that something did — that is what
+         * made a rolled back transaction still report `x -> x` on the next flush. A
+         * notification that was already owed before the transaction is left owed.
+         *
+         * Set here rather than through clear_pending(), which also clears `dirty` and
+         * would undo the marking just below. */
+        subject->pending_notify = w->old_pending;
+
+        /* A computed Subject's value is reproducible, so it is simply marked stale and
+         * recomputed on the next read rather than being restored. */
+        if(subject->has_mapper) mark_dirty(subject);
+        else list_reposition(subject);
+
+        w = lv_ll_get_prev(&txn_writes, w);
+    }
+
+    lv_ll_clear(&txn_writes);
+    /* Clearing the last pending notification can leave the flush timer with nothing to
+     * do, and it only stops when something asks. */
+    flush_timer_update();
+    global->subject_txn_depth = 0;
+    global->subject_txn_aborting = 0;
+    /* Nothing is left to commit, and the caller has no other way to learn that. */
+    global->subject_txn_aborted = 1;
+}
+
+/* Hand a write to the Subject's setter, which turns it into writes further up. */
+static bool run_setter(lv_subject_t * subject, lv_subject_value_t value)
+{
+    if(!txn_setter_write_ok(subject, value)) return false;
+
+    bool ok;
+    switch(subject->type) {
+        case LV_SUBJECT_TYPE_INT:
+            ok = subject->setter.int_cb(subject, subject->setter_user_data, value.num);
+            break;
+#if LV_USE_FLOAT
+        case LV_SUBJECT_TYPE_FLOAT:
+            ok = subject->setter.float_cb(subject, subject->setter_user_data, value.float_v);
+            break;
+#endif
+        case LV_SUBJECT_TYPE_COLOR:
+            ok = subject->setter.color_cb(subject, subject->setter_user_data, value.color);
+            break;
+        case LV_SUBJECT_TYPE_POINTER:
+            ok = subject->setter.pointer_cb(subject, subject->setter_user_data,
+                                            (void *)value.pointer);
+            break;
+        case LV_SUBJECT_TYPE_STRING:
+            ok = subject->setter.string_cb(subject, subject->setter_user_data,
+                                           (const char *)value.pointer);
+            break;
+        default:
+            ok = false;
+            break;
+    }
+    return ok;
+}
+
+/* A copying write to a Subject whose mapper owns its value.
+ *
+ * Returns true when the caller should stop — the write has been handed to the Subject's
+ * setter, or refused for want of one — and false when it should carry on and copy. */
+static bool copy_write_handled(lv_subject_t * subject, const void * data, bool * ok)
+{
+    if(!subject->has_mapper) return false;
+
+    lv_subject_value_t v = { .pointer = data };
+    *ok = mapped_write(subject, v);
+    return true;
+}
+
+/* The write path of a Subject that has a mapper.
+ *
+ * Its value belongs to the mapper, so the write only means something if the Subject has
+ * a setter to turn it into writes on the Subjects the mapper reads. */
+static bool mapped_write(lv_subject_t * subject, lv_subject_value_t value)
+{
+    if(!subject->has_setter) {
+        LV_LOG_WARN("This Subject's value is computed by its mapper, so it cannot be written. "
+                    "Give it a setter with lv_subject_set_..._setter() to make it writable, or "
+                    "write the Subjects its mapper reads.");
+        return false;
+    }
+
+    txn_enter();
+    if(!run_setter(subject, value)) {
+        txn_abort();
+        return false;
+    }
+    txn_leave();
+    return true;
+}
+
 /* A mapper must be pure with respect to the Subject graph: it may read Subjects, never
  * write them. Allowing a write would mean an evaluation could re-enter the update path
  * and re-dirty what is being computed, so ordering and termination stop being
@@ -1881,7 +2591,6 @@ static void buf_release(lv_subject_t * subject)
     lv_free(b);
     subject->buf = NULL;
     subject->value.pointer = NULL;
-    subject->last_input.pointer = NULL;
 }
 
 /* Make sure the buffer can hold `needed` bytes, growing it if it can and must.
@@ -1917,22 +2626,18 @@ static bool buf_reserve(lv_subject_t * subject, size_t needed, bool warn)
         return false;
     }
 
+    /* A first allocation hands back uninitialised bytes. Terminate them like
+     * lv_subject_set_buffer() does, so change detection can read the buffer before
+     * anything has been stored in it. */
+    if(b->capacity == 0 && subject->type == LV_SUBJECT_TYPE_STRING) {
+        ((char *)grown)[0] = '\0';
+    }
+
     b->buf = grown;
     b->capacity = needed;
     /* The value is the buffer, so it moves with it. */
     subject->value.pointer = grown;
-    subject->last_input.pointer = grown;
     return true;
-}
-
-static bool input_convertible(const lv_subject_t * subject)
-{
-    if(subject->has_mapper) return true;
-    if(subject->input_type == subject->type) return true;
-
-    LV_LOG_WARN("This Subject is written as one type and observed as another, but has no "
-                "mapper to convert with. The write is IGNORED. Set a mapper for the value type.");
-    return false;
 }
 
 static bool write_allowed(void)
@@ -1949,22 +2654,22 @@ static bool write_allowed(void)
 /* Change detection for a Subject with no mapper: compare the value just written against
  * the stored one, and store it. No history is kept, so there is nothing else to compare
  * against. `borrowed_input` is the new string for LV_SUBJECT_TYPE_STRING and unused otherwise. */
-static bool apply_input(lv_subject_t * subject, const void * borrowed_input)
+static bool store_written(lv_subject_t * subject, lv_subject_value_t v, const void * str)
 {
     switch(subject->type) {
         case LV_SUBJECT_TYPE_INT:
-            if(subject->value.num == subject->last_input.num) return false;
-            subject->value.num = subject->last_input.num;
+            if(subject->value.num == v.num) return false;
+            subject->value.num = v.num;
             return true;
 #if LV_USE_FLOAT
         case LV_SUBJECT_TYPE_FLOAT:
-            if(subject->value.float_v == subject->last_input.float_v) return false;
-            subject->value.float_v = subject->last_input.float_v;
+            if(subject->value.float_v == v.float_v) return false;
+            subject->value.float_v = v.float_v;
             return true;
 #endif
         case LV_SUBJECT_TYPE_COLOR:
-            if(lv_color_to_u32(subject->value.color) == lv_color_to_u32(subject->last_input.color)) return false;
-            subject->value.color = subject->last_input.color;
+            if(lv_color_to_u32(subject->value.color) == lv_color_to_u32(v.color)) return false;
+            subject->value.color = v.color;
             return true;
         case LV_SUBJECT_TYPE_POINTER:
             if(subject->buf != NULL) {
@@ -1974,17 +2679,17 @@ static bool apply_input(lv_subject_t * subject, const void * borrowed_input)
             }
             /* Referring: documented to notify whether or not the pointer itself changed,
              * because the data behind an unchanged pointer may have changed. */
-            subject->value.pointer = subject->last_input.pointer;
+            subject->value.pointer = v.pointer;
             return true;
         case LV_SUBJECT_TYPE_STRING:
             if(subject->buf == NULL) {
                 /* No buffer, so this Subject stores the pointer rather than copying. */
-                subject->value.pointer = subject->last_input.pointer;
+                subject->value.pointer = v.pointer;
                 return true;
             }
-            if(borrowed_input == NULL) return false;
+            if(str == NULL) return false;
             if(!subject->copy_changed) return false;
-            lv_strlcpy((char *)subject->buf->buf, borrowed_input, buf_capacity(subject));
+            lv_strlcpy((char *)subject->buf->buf, str, buf_capacity(subject));
             subject->buf->length = lv_strlen((const char *)subject->buf->buf);
             return true;
         default:
@@ -1994,7 +2699,7 @@ static bool apply_input(lv_subject_t * subject, const void * borrowed_input)
 }
 
 /* Run the mapper with dependency tracking on. Returns whether it reported a change. */
-static bool run_mapper(lv_subject_t * subject, const void * borrowed_input)
+static bool run_mapper(lv_subject_t * subject)
 {
     if(subject->evaluating) {
         LV_LOG_WARN("Dependency cycle detected, a subject's mapper reads the subject itself");
@@ -2009,51 +2714,36 @@ static bool run_mapper(lv_subject_t * subject, const void * borrowed_input)
     global->subject_evaluating = subject;
     deps_clear(subject);
 
-    /* The input arrives as the union, because a Subject's input type need not be the
-     * type of its value. The mapper reads the member matching the input type.
-     *
-     * A pointer input is retained, so a re-evaluation caused by a dependency change gets
-     * the same pointer the last write carried. The caller answers for it: it has to stay
-     * valid until a new input is written, or its ownership has to be transferred with
-     * `lv_subject_set_pointer_owned()`.
-     *
-     * A string input is the one exception: NULL on a re-evaluation. `lv_subject_snprintf()`
-     * formats into a temporary it frees before returning, so retaining that pointer would
-     * leave a dangling one; and it is not needed, because a string mapper re-derives from
-     * `buf`, which still holds the last value. The *value* is retained either way. */
-    lv_subject_value_t input = subject->last_input;
-    if(subject->input_type == LV_SUBJECT_TYPE_STRING) input.pointer = borrowed_input;
-
     bool changed = false;
     switch(subject->type) {
         case LV_SUBJECT_TYPE_INT: {
                 int32_t value = subject->value.num;
-                changed = subject->mapper.int_cb(subject, ud, input, &value);
+                changed = subject->mapper.int_cb(subject, ud, &value);
                 subject->value.num = value;
                 break;
             }
 #if LV_USE_FLOAT
         case LV_SUBJECT_TYPE_FLOAT: {
                 float value = subject->value.float_v;
-                changed = subject->mapper.float_cb(subject, ud, input, &value);
+                changed = subject->mapper.float_cb(subject, ud, &value);
                 subject->value.float_v = value;
                 break;
             }
 #endif
         case LV_SUBJECT_TYPE_POINTER: {
                 const void * value = subject->value.pointer;
-                changed = subject->mapper.pointer_cb(subject, ud, input, &value);
+                changed = subject->mapper.pointer_cb(subject, ud, &value);
                 subject->value.pointer = value;
                 break;
             }
         case LV_SUBJECT_TYPE_COLOR: {
                 lv_color_t value = subject->value.color;
-                changed = subject->mapper.color_cb(subject, ud, input, &value);
+                changed = subject->mapper.color_cb(subject, ud, &value);
                 subject->value.color = value;
                 break;
             }
         case LV_SUBJECT_TYPE_STRING:
-            changed = subject->mapper.string_cb(subject, ud, input, (char *)subject->value.pointer,
+            changed = subject->mapper.string_cb(subject, ud, (char *)subject->value.pointer,
                                                 buf_capacity(subject));
             break;
         case LV_SUBJECT_TYPE_NONE:
@@ -2072,91 +2762,11 @@ static bool run_mapper(lv_subject_t * subject, const void * borrowed_input)
 
 /* Update the stored value from the mapper (or the plain comparison) and propagate if it
  * changed. */
-/* Can a write just record the input and mark the Subject stale, leaving the mapper for
- * whoever reads it next?
- *
- * Only for a Subject that is genuinely lazy, and only when nothing about it needs the
- * mapper to have run already. Three cases have to evaluate on the spot:
- *
- * - it is evaluating eagerly, which is the whole meaning of eager;
- * - it owns its value, because ownership of the incoming pointer is only transferred
- *   once the mapper stores it. Deferring would let a second write supersede an input
- *   that was never stored, and nothing would ever release it;
- * - its input is pointer-shaped, i.e. `LV_SUBJECT_TYPE_POINTER` or
- *   `LV_SUBJECT_TYPE_STRING`. Such an input is borrowed: it is only guaranteed valid for
- *   the duration of the write, and the mapper may well read *through* it rather than
- *   just storing it. Running the mapper later could dereference memory that is already
- *   gone, and a string input is not retained at all so deferring would lose it.
- *
- * So deferral applies to the scalar inputs, which is where coalescing a run of writes
- * into one evaluation is worth anything anyway.
- */
-static bool can_defer_mapper(const lv_subject_t * subject)
+
+/* Everything that happens once a Subject's value has been decided, whether it was
+ * written or computed. */
+static void publish(lv_subject_t * subject, bool changed)
 {
-    if(!subject->has_mapper) return false;   /* nothing to defer */
-    if(subject_is_eager_now(subject)) return false;
-    /* Subsumed by the two checks below today, because ownership can only be established
-     * through a pointer-shaped write. Kept because it states the actual requirement:
-     * ownership of an incoming pointer only transfers once the mapper stores it. */
-    if(subject->owns_value) return false;
-    if(subject->input_type == LV_SUBJECT_TYPE_POINTER) return false;
-    if(subject->input_type == LV_SUBJECT_TYPE_STRING) return false;
-    return true;
-}
-
-/* The path every `lv_subject_set_...()` goes through. */
-static void subject_input_written(lv_subject_t * subject, const void * borrowed_input,
-                                  void * superseded_input, bool superseded_input_owned)
-{
-    if(!can_defer_mapper(subject)) {
-        subject_commit_input(subject, borrowed_input, superseded_input, superseded_input_owned);
-        return;
-    }
-
-    /* Lazy: record the input and go no further. A run of writes therefore costs one
-     * evaluation instead of one per write, and a Subject nothing ever reads is never
-     * evaluated at all. */
-    subject->input_pending = 1;
-    mark_dirty(subject);
-
-    /* The dependents have to be marked stale even though it is not yet known whether the
-     * value actually changed. Each of them does its own change detection when it
-     * re-evaluates, so at worst this costs a re-evaluation that reports no change. */
-    mark_dependents_dirty(subject);
-
-    /* An eager dependent is due now, and evaluating it pulls this Subject, so the mapper
-     * still runs inside this call whenever something downstream needs it. */
-    process_dirty(false);
-}
-
-static void subject_commit_input(lv_subject_t * subject, const void * borrowed_input,
-                                 void * superseded_input, bool superseded_input_owned)
-{
-    /* Remember what is about to be replaced. The mapper may still read it to decide
-     * whether anything changed, so it can only be released afterwards. */
-    void * outgoing = (void *)subject->value.pointer;
-    bool outgoing_owned = subject->owns_value;
-
-    /* The mapper runs here, so the stored value is the mapped one and the raw input is
-     * never observable through a getter. */
-    bool changed = subject->has_mapper ? run_mapper(subject, borrowed_input) : apply_input(subject, borrowed_input);
-    subject->input_pending = 0;
-
-    /* Settle who owns the value that is now stored. Ownership follows what the write
-     * handed in: the input's if the mapper stored the input, the old value's if the
-     * mapper kept it, and borrowed for anything else the mapper came up with on its own. */
-    if(subject->type == LV_SUBJECT_TYPE_POINTER || subject->type == LV_SUBJECT_TYPE_STRING) {
-        if(subject->value.pointer == subject->last_input.pointer) subject->owns_value = subject->owns_input;
-        else if(subject->value.pointer == outgoing) subject->owns_value = outgoing_owned;
-        else subject->owns_value = 0;
-    }
-
-    /* Now the mapper is done with them. A mapper that kept the old value, either by
-     * returning false or by storing it again, keeps it alive. `outgoing` and
-     * `superseded_input` are usually the same pointer, so release each at most once. */
-    release_if_unreferenced(subject, outgoing, outgoing_owned);
-    if(superseded_input != outgoing) release_if_unreferenced(subject, superseded_input, superseded_input_owned);
-
     subject->dirty = 0;
     if(!changed) {
         list_reposition(subject);
@@ -2165,27 +2775,81 @@ static void subject_commit_input(lv_subject_t * subject, const void * borrowed_i
 
     /* A real change, so anything that read the old value is out of date. */
     subject->version++;
+    subject->changed_at = LV_GLOBAL_DEFAULT()->subject_txn_id;
 
     /* Phase 1: everything downstream is now stale. Always synchronous, so a read of a
      * dependent can never return a stale value. */
     mark_dependents_dirty(subject);
 
-    /* Phase 2a: this Subject's own Observers. */
-    if(subject_is_eager_now(subject)) {
-        clear_pending(subject);
-        notify(subject);
-    }
-    else {
-        /* The value is up to date; the Observers wait for the next flush. This is what
-         * makes LV_OBSERVER_MODE_BATCHED coalesce a run of writes into one notification. */
-        mark_pending_notify(subject);
+    /* Phase 2: the Observers wait. Notification happens once the transaction has ended,
+     * in `txn_leave()`, never from inside it — so an Observer always sees a settled graph,
+     * and a write it makes is a transaction of its own rather than a nested one. */
+    mark_pending_notify(subject);
+}
+
+/* Re-evaluate a Subject whose mapper owns its value. */
+static void subject_evaluate(lv_subject_t * subject)
+{
+    if(!subject->has_mapper) {
+        /* Nothing to re-derive from. A plain Subject can still be marked dirty, e.g. by
+         * a rolled-back transaction, and simply has nothing to do about it. */
+        subject->dirty = 0;
+        list_reposition(subject);
+        return;
     }
 
-    /* Phase 2b: evaluate the eager Subjects that just went stale. This runs whatever
-     * this Subject's own mode is, because eagerness is a property of the *dependents*:
-     * a plain lazy source feeding an eager derived Subject still has to drive it. Their
-     * mappers pull their dependencies, so each evaluates once on consistent inputs. */
-    process_dirty(false);
+    void * outgoing = (void *)subject->value.pointer;
+    bool outgoing_owned = subject->owns_value;
+
+    txn_record_change(subject);
+    bool changed = run_mapper(subject);
+
+    if(subject->type == LV_SUBJECT_TYPE_POINTER || subject->type == LV_SUBJECT_TYPE_STRING) {
+        /* A mapper cannot take ownership of anything: what it produced is borrowed unless
+         * it handed back the value the Subject already owned. */
+        if(subject->value.pointer != outgoing) subject->owns_value = 0;
+        release_if_unreferenced(subject, outgoing, outgoing_owned);
+    }
+
+    publish(subject, changed);
+}
+
+/* The path every write to a plain Subject goes through.
+ *
+ * A Subject with a mapper never gets here: its value belongs to the mapper, so a write
+ * is either refused or routed through its setter.
+ *
+ * `owned` says whether the Subject takes over the pointer being written, and
+ * `superseded` is a pointer an earlier write left behind. Both mean nothing for the
+ * value types. */
+static void subject_write(lv_subject_t * subject, lv_subject_value_t v, const void * str,
+                          bool owned, void * superseded, bool superseded_owned)
+{
+    txn_enter();
+
+    /* Remember what is about to be replaced, so it can be released once nothing refers
+     * to it any more. */
+    void * outgoing = (void *)subject->value.pointer;
+    bool outgoing_owned = subject->owns_value;
+
+    txn_record_change(subject);
+    bool changed = store_written(subject, v, str);
+
+    if(subject->type == LV_SUBJECT_TYPE_POINTER || subject->type == LV_SUBJECT_TYPE_STRING) {
+        /* A copying Subject never owns its value separately: the buffer is the value. */
+        if(subject->buf != NULL) subject->owns_value = 0;
+        else subject->owns_value = (subject->value.pointer == v.pointer && owned) ? 1U : 0U;
+
+        /* Freeing cannot be undone, so while a transaction is open the old value stays
+         * alive in the write set and the commit releases it. */
+        if(txn_find(subject) == NULL) {
+            release_if_unreferenced(subject, outgoing, outgoing_owned);
+        }
+        if(superseded != outgoing) release_if_unreferenced(subject, superseded, superseded_owned);
+    }
+
+    publish(subject, changed);
+    txn_leave();
 }
 
 
@@ -2200,13 +2864,9 @@ static void subject_commit_input(lv_subject_t * subject, const void * borrowed_i
  * evaluation, not one per level.
  *
  * Only for a dependency-driven re-evaluation: a direct write goes through
- * `subject_input_written()` and always runs the mapper. */
+ * a write, which never reaches a Subject that has a mapper. */
 static bool deps_are_unchanged(lv_subject_t * subject)
 {
-    /* A deferred write lands here too, and then the input itself is new, so the mapper
-     * has to run whatever the dependencies say. */
-    if(subject->input_pending) return false;
-
     uint32_t dep_cnt = ref_list_count(&subject->deps);
     if(dep_cnt == 0) return false;   /* nothing recorded yet, so it has to run */
 
@@ -2238,7 +2898,7 @@ static void subject_recompute(lv_subject_t * subject)
         return;
     }
 
-    subject_commit_input(subject, NULL, NULL, false);
+    subject_evaluate(subject);
 }
 
 /* Called by every getter: bring a dirty Subject up to date before its value is read.
@@ -2295,20 +2955,24 @@ static bool set_mapper_allowed(lv_subject_t * subject, lv_subject_type_t type)
 /*---------------------------------------------------------------
  * Derived-subject helpers
  *
- * `lv_subject_create_min()` / `_max()` record the extremum a source has passed through.
  * `lv_subject_create_clamped()` mirrors a source bounded to a range.
  *
- * All of them keep their configuration in the mapper's user data, which the Subject
- * owns and frees. That is what lets one mapper serve every instance.
+ * It keeps its configuration in the mapper's user data, which the Subject owns and
+ * frees. That is what lets one mapper serve every instance.
+ *
+ * There used to be `lv_subject_create_min()` / `_max()` here, recording the extremum a
+ * source had passed through. They were the library's only accumulating mappers, and an
+ * accumulator's answer depends on how often it ran rather than on its inputs. Write one
+ * as an eager Subject instead: see @ref lv_subject_set_mode.
  *--------------------------------------------------------------*/
 
 typedef struct {
     lv_subject_t * source;
     lv_subject_compare_cb_t compare_cb;  /**< NULL means natural ordering */
-    lv_subject_value_t min_value;        /**< Clamp only */
-    lv_subject_value_t max_value;        /**< Clamp only */
-    bool want_max;                       /**< Extremum only */
-    bool seeded;                         /**< Extremum only: has a first value been recorded? */
+    lv_subject_value_t min_value;
+    lv_subject_value_t max_value;
+    bool seeded;                         /**< Has a first value been stored? */
+    bool is_clamp;                       /**< Marks the user data as a clamp's, for set_range */
 } derived_dsc_t;
 
 int lv_subject_compare_int(lv_subject_t * subject, lv_subject_value_t a, lv_subject_value_t b)
@@ -2392,90 +3056,21 @@ static lv_subject_value_t read_source(lv_subject_t * source)
     return v;
 }
 
-/* Shared body of the extremum mappers: keep the source's value if it beats the stored
- * one. `*value` is the Subject's own slot, so the extremum survives across evaluations. */
-static bool extremum_step(lv_subject_t * subject, void * user_data, lv_subject_value_t * value)
-{
-    derived_dsc_t * dsc = user_data;
-    lv_subject_value_t next = read_source(dsc->source);
 
-    if(!dsc->seeded) {
-        dsc->seeded = true;
-        *value = next;
-        return true;
-    }
-
-    lv_subject_compare_cb_t compare = dsc->compare_cb ? dsc->compare_cb : natural_compare;
-    int order = compare(subject, next, *value);
-    if(dsc->want_max ? (order <= 0) : (order >= 0)) return false;
-
-    *value = next;
-    return true;
-}
-
-static bool extremum_int_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
-{
-    LV_UNUSED(input);
-    lv_subject_value_t slot;
-    lv_memzero(&slot, sizeof(slot));
-    slot.num = *value;
-    if(!extremum_step(subject, user_data, &slot)) return false;
-    *value = slot.num;
-    return true;
-}
 
 #if LV_USE_FLOAT
-static bool extremum_float_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, float * value)
-{
-    LV_UNUSED(input);
-    lv_subject_value_t slot;
-    lv_memzero(&slot, sizeof(slot));
-    slot.float_v = *value;
-    if(!extremum_step(subject, user_data, &slot)) return false;
-    *value = slot.float_v;
-    return true;
-}
 #endif
 
-static bool extremum_color_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                  lv_color_t * value)
-{
-    LV_UNUSED(input);
-    lv_subject_value_t slot;
-    lv_memzero(&slot, sizeof(slot));
-    slot.color = *value;
-    if(!extremum_step(subject, user_data, &slot)) return false;
-    *value = slot.color;
-    return true;
-}
 
-static bool extremum_pointer_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                    const void ** value)
-{
-    LV_UNUSED(input);
-    lv_subject_value_t slot;
-    lv_memzero(&slot, sizeof(slot));
-    slot.pointer = *value;
-    if(!extremum_step(subject, user_data, &slot)) return false;
-    *value = slot.pointer;
-    return true;
-}
 
 /* Bound the source's value, ordering with the compare callback so the same code works
  * for a colour or a struct pointer as for an int. */
-static bool clamp_step(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                       lv_subject_value_t * value)
+static bool clamp_step(lv_subject_t * subject, void * user_data, lv_subject_value_t * value)
 {
     derived_dsc_t * dsc = user_data;
 
-    /* The bounds are the Subject's input: writing an lv_subject_range_t re-clamps.
-     * The values are copied out, so the caller's struct may be transient. */
-    if(input.pointer != NULL) {
-        const lv_subject_range_t * range = input.pointer;
-        dsc->min_value = range->min_value;
-        dsc->max_value = range->max_value;
-    }
-
+    /* The bounds live in the mapper's own state. `lv_subject_set_range()` changes them
+     * and re-evaluates; the mapper only ever reads them. */
     lv_subject_value_t next = read_source(dsc->source);
     lv_subject_compare_cb_t compare = dsc->compare_cb ? dsc->compare_cb : natural_compare;
 
@@ -2495,53 +3090,53 @@ static bool clamp_step(lv_subject_t * subject, void * user_data, lv_subject_valu
     return true;
 }
 
-static bool clamp_int_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+static bool clamp_int_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     lv_subject_value_t slot;
     lv_memzero(&slot, sizeof(slot));
     slot.num = *value;
-    if(!clamp_step(subject, user_data, input, &slot)) return false;
+    if(!clamp_step(subject, user_data, &slot)) return false;
     *value = slot.num;
     return true;
 }
 
 #if LV_USE_FLOAT
-static bool clamp_float_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, float * value)
+static bool clamp_float_mapper(lv_subject_t * subject, void * user_data, float * value)
 {
     lv_subject_value_t slot;
     lv_memzero(&slot, sizeof(slot));
     slot.float_v = *value;
-    if(!clamp_step(subject, user_data, input, &slot)) return false;
+    if(!clamp_step(subject, user_data, &slot)) return false;
     *value = slot.float_v;
     return true;
 }
 #endif
 
-static bool clamp_color_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, lv_color_t * value)
+static bool clamp_color_mapper(lv_subject_t * subject, void * user_data, lv_color_t * value)
 {
     lv_subject_value_t slot;
     lv_memzero(&slot, sizeof(slot));
     slot.color = *value;
-    if(!clamp_step(subject, user_data, input, &slot)) return false;
+    if(!clamp_step(subject, user_data, &slot)) return false;
     *value = slot.color;
     return true;
 }
 
-static bool clamp_pointer_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                 const void ** value)
+static bool clamp_pointer_mapper(lv_subject_t * subject, void * user_data, const void ** value)
 {
     lv_subject_value_t slot;
     lv_memzero(&slot, sizeof(slot));
     slot.pointer = *value;
-    if(!clamp_step(subject, user_data, input, &slot)) return false;
+    if(!clamp_step(subject, user_data, &slot)) return false;
     *value = slot.pointer;
     return true;
 }
 
 /* Create the derived Subject, attach the right typed mapper for the source's type, and
  * hand it ownership of `dsc`. */
-static lv_subject_t * create_derived(lv_subject_t * source, derived_dsc_t * dsc, bool is_clamp)
+static lv_subject_t * create_derived(lv_subject_t * source, derived_dsc_t * dsc)
 {
+    dsc->is_clamp = true;
     lv_subject_t * subject = lv_subject_create((lv_subject_type_t)source->type);
     if(subject == NULL) {
         lv_free(dsc);
@@ -2550,41 +3145,55 @@ static lv_subject_t * create_derived(lv_subject_t * source, derived_dsc_t * dsc,
 
     subject->owns_mapper_user_data = 1;
 
-    /* A clamped Subject takes its bounds through its own setter, as an
-     * lv_subject_range_t, so it is written as a pointer whatever its value type is. */
-    if(is_clamp) subject->input_type = (uint32_t)LV_SUBJECT_TYPE_POINTER;
-
-    /* An extremum has to see every value the source passes through, not only the ones
-     * somebody happened to read, so it is eager. A clamp is a pure mirror and stays lazy. */
-    if(!is_clamp) subject->mode = 1U; /* LV_SUBJECT_MODE_EAGER */
-
+    /* A clamp is a pure mirror of its source, so it stays lazy: it is computed when
+     * something reads it. */
     switch(source->type) {
         case LV_SUBJECT_TYPE_INT:
-            lv_subject_set_int_mapper(subject, is_clamp ? clamp_int_mapper : extremum_int_mapper, dsc);
+            lv_subject_set_int_mapper(subject, clamp_int_mapper, dsc);
             break;
 #if LV_USE_FLOAT
         case LV_SUBJECT_TYPE_FLOAT:
-            lv_subject_set_float_mapper(subject, is_clamp ? clamp_float_mapper : extremum_float_mapper, dsc);
+            lv_subject_set_float_mapper(subject, clamp_float_mapper, dsc);
             break;
 #endif
         case LV_SUBJECT_TYPE_COLOR:
-            lv_subject_set_color_mapper(subject, is_clamp ? clamp_color_mapper : extremum_color_mapper, dsc);
+            lv_subject_set_color_mapper(subject, clamp_color_mapper, dsc);
             break;
         case LV_SUBJECT_TYPE_STRING:
-            /* A string Subject owns a buffer, so this would have to copy into it. Track
-             * the winning string through a pointer Subject instead. */
-            LV_LOG_WARN("The min/max/clamped helpers do not support string subjects, "
+            /* A string Subject owns a buffer, so this would have to copy into it. Bound
+             * a pointer Subject instead. */
+            LV_LOG_WARN("lv_subject_create_clamped() does not support string subjects, "
                         "use a pointer subject");
             subject->owns_mapper_user_data = 0;
             lv_subject_delete(subject);
             lv_free(dsc);
             return NULL;
         default:
-            lv_subject_set_pointer_mapper(subject, is_clamp ? clamp_pointer_mapper : extremum_pointer_mapper, dsc);
+            lv_subject_set_pointer_mapper(subject, clamp_pointer_mapper, dsc);
             break;
     }
 
     return subject;
+}
+
+void lv_subject_set_range(lv_subject_t * subject, const lv_subject_range_t * range)
+{
+    LV_CHECK_ARG(subject != NULL, return);
+    LV_CHECK_ARG(range != NULL, return);
+    LV_CHECK_ARG(subject->has_mapper && subject->owns_mapper_user_data, return);
+
+    derived_dsc_t * dsc = subject->mapper_user_data;
+    LV_CHECK_ARG(dsc != NULL && dsc->is_clamp, return);
+
+    /* Copied out, so the caller's struct may be transient. */
+    dsc->min_value = range->min_value;
+    dsc->max_value = range->max_value;
+
+    /* The dependencies have not changed, so the version short-circuit would skip the
+     * mapper. Commit directly, which always runs it. */
+    txn_enter();
+    subject_evaluate(subject);
+    txn_leave();
 }
 
 static derived_dsc_t * derived_dsc_create(lv_subject_t * source, lv_subject_compare_cb_t compare_cb)
@@ -2609,29 +3218,7 @@ static bool ordering_available(const lv_subject_t * source, lv_subject_compare_c
     return false;
 }
 
-lv_subject_t * lv_subject_create_min(lv_subject_t * source, lv_subject_compare_cb_t compare_cb)
-{
-    LV_CHECK_ARG(source != NULL, return NULL);
-    LV_CHECK_ARG(source->type != LV_SUBJECT_TYPE_INVALID && source->type != LV_SUBJECT_TYPE_NONE, return NULL);
-    if(!ordering_available(source, compare_cb)) return NULL;
 
-    derived_dsc_t * dsc = derived_dsc_create(source, compare_cb);
-    if(dsc == NULL) return NULL;
-    dsc->want_max = false;
-    return create_derived(source, dsc, false);
-}
-
-lv_subject_t * lv_subject_create_max(lv_subject_t * source, lv_subject_compare_cb_t compare_cb)
-{
-    LV_CHECK_ARG(source != NULL, return NULL);
-    LV_CHECK_ARG(source->type != LV_SUBJECT_TYPE_INVALID && source->type != LV_SUBJECT_TYPE_NONE, return NULL);
-    if(!ordering_available(source, compare_cb)) return NULL;
-
-    derived_dsc_t * dsc = derived_dsc_create(source, compare_cb);
-    if(dsc == NULL) return NULL;
-    dsc->want_max = true;
-    return create_derived(source, dsc, false);
-}
 
 lv_subject_t * lv_subject_create_clamped(lv_subject_t * source, lv_subject_value_t min_value,
                                          lv_subject_value_t max_value, lv_subject_compare_cb_t compare_cb)
@@ -2644,7 +3231,7 @@ lv_subject_t * lv_subject_create_clamped(lv_subject_t * source, lv_subject_value
     if(dsc == NULL) return NULL;
     dsc->min_value = min_value;
     dsc->max_value = max_value;
-    return create_derived(source, dsc, true);
+    return create_derived(source, dsc);
 }
 
 /*---------------------------------------------------------------
@@ -2697,9 +3284,7 @@ static void init_int(lv_subject_t * subject, int32_t value)
 {
     LV_ASSERT(subject != NULL);
     subject->type = LV_SUBJECT_TYPE_INT;
-    subject->input_type = LV_SUBJECT_TYPE_INT;
     subject->value.num = value;
-    subject->last_input.num = value;
 }
 
 #if LV_USE_FLOAT
@@ -2708,9 +3293,7 @@ static void init_float(lv_subject_t * subject, float value)
 {
     LV_ASSERT(subject != NULL);
     subject->type = LV_SUBJECT_TYPE_FLOAT;
-    subject->input_type = LV_SUBJECT_TYPE_FLOAT;
     subject->value.float_v = value;
-    subject->last_input.float_v = value;
 }
 
 #endif /*LV_USE_FLOAT*/
@@ -2719,18 +3302,14 @@ static void init_pointer(lv_subject_t * subject, void * value)
 {
     LV_ASSERT(subject != NULL);
     subject->type = LV_SUBJECT_TYPE_POINTER;
-    subject->input_type = LV_SUBJECT_TYPE_POINTER;
     subject->value.pointer = value;
-    subject->last_input.pointer = value;
 }
 
 static void init_color(lv_subject_t * subject, lv_color_t color)
 {
     LV_ASSERT(subject != NULL);
     subject->type = LV_SUBJECT_TYPE_COLOR;
-    subject->input_type = LV_SUBJECT_TYPE_COLOR;
     subject->value.color = color;
-    subject->last_input.color = color;
 }
 
 
@@ -2741,7 +3320,6 @@ static void init_string(lv_subject_t * subject, char * buf, size_t size, const c
     LV_ASSERT(buf != NULL || size == 0);
 
     subject->type = LV_SUBJECT_TYPE_STRING;
-    subject->input_type = LV_SUBJECT_TYPE_STRING;
 
     if(buf != NULL && size > 0) {
         lv_subject_buf_t * b = lv_malloc_zeroed(sizeof(lv_subject_buf_t));
@@ -2775,6 +3353,7 @@ static void deinit(lv_subject_t * subject)
     /* Both directions, so deleting a Subject in the middle of a graph leaves no
      * dangling edge in its dependencies or its dependents. */
     edges_teardown(subject);
+    static_deps_release(subject);
     subject->has_mapper = 0;
     subject->dirty = 0;
     subject->pending_notify = 0;
@@ -2782,24 +3361,15 @@ static void deinit(lv_subject_t * subject)
     /* A copying Subject's storage goes with it, released by its own free_cb. */
     buf_release(subject);
 
-    /* Whatever the Subject owns goes with it: the stored value, and the retained input
-     * if it is a different pointer. */
-    {
-        void * stored = subject->owns_value ? (void *)subject->value.pointer : NULL;
-        void * retained = subject->owns_input ? (void *)subject->last_input.pointer : NULL;
-
+    /* Whatever the Subject owns goes with it. */
+    if(subject->owns_value) {
+        void * stored = (void *)subject->value.pointer;
         subject->value.pointer = NULL;
-        subject->last_input.pointer = NULL;
         subject->owns_value = 0;
-        subject->owns_input = 0;
 
         if(stored != NULL) {
             if(subject->value_free_cb) subject->value_free_cb(stored);
             else lv_free(stored);
-        }
-        if(retained != NULL && retained != stored) {
-            if(subject->value_free_cb) subject->value_free_cb(retained);
-            else lv_free(retained);
         }
     }
 

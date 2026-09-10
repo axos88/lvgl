@@ -18,10 +18,11 @@ typedef struct {
 
 static sample_watch_t watch;
 
+/*What the driver publishes, and what the filtered subject is derived from.*/
+static lv_subject_t * subject_raw;
 static lv_subject_t * subject_sample;
 
-static bool sample_changed_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                  const void ** value);
+static bool sample_changed_mapper(lv_subject_t * subject, void * user_data, const void ** value);
 static void sample_observer_cb(lv_observer_t * observer, lv_subject_t * subject);
 
 /**
@@ -33,11 +34,14 @@ static void sample_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
  * to know. For a driver that publishes the same buffer every few milliseconds that
  * means a notification per poll, whether anything moved or not.
  *
- * A mapper fixes this. It keeps a last-known-good **copy** of the struct in its
- * captured state and compares the incoming contents against it, so the subject notifies
- * only when the values actually differ. Because the copy lives in the mapper's
- * `user_data`, one mapper function can serve any number of subjects, each with its own
- * copy.
+ * A derived subject fixes this. `subject_raw` is what the driver writes, and it does
+ * notify on every poll. `subject_sample` is computed from it: it keeps a
+ * last-known-good **copy** of the struct in its captured state, compares the contents
+ * against it, and returns `false` when nothing moved. A mapper that reports no change
+ * leaves the subject's version alone, so nothing downstream runs.
+ *
+ * Because the copy lives in the mapper's `user_data`, one mapper function can serve any
+ * number of subjects, each with its own copy.
  *
  * Note what this cannot be done with: comparing pointers. The pointer is identical
  * every time. The comparison has to be on the contents, which means somebody has to
@@ -50,8 +54,15 @@ void lv_example_observer_10(void)
     if(!inited) {
         lv_memzero(&watch, sizeof(watch));
 
+        subject_raw = lv_subject_create(LV_SUBJECT_TYPE_POINTER);
+
         subject_sample = lv_subject_create(LV_SUBJECT_TYPE_POINTER);
         lv_subject_set_pointer_mapper(subject_sample, sample_changed_mapper, &watch);
+
+        /*Declared so `subject_raw` cannot be deleted while this mapper needs it.*/
+        static lv_subject_t * sample_deps[1];
+        sample_deps[0] = subject_raw;
+        lv_subject_set_static_deps(subject_sample, sample_deps, 1);
 
         inited = true;
     }
@@ -66,24 +77,23 @@ void lv_example_observer_10(void)
     /* 💡 The same pointer is published four times, but only two are real changes. */
     sample.x = 10;
     sample.y = 20;
-    lv_subject_set_pointer(subject_sample, &sample);   /*notifies: first value*/
+    lv_subject_set_pointer(subject_raw, &sample);      /*notifies: first value*/
 
-    lv_subject_set_pointer(subject_sample, &sample);   /*silent: nothing moved*/
+    lv_subject_set_pointer(subject_raw, &sample);      /*silent: nothing moved*/
 
     sample.y = 21;                                     /*the driver mutates in place*/
-    lv_subject_set_pointer(subject_sample, &sample);   /*notifies: y changed*/
+    lv_subject_set_pointer(subject_raw, &sample);      /*notifies: y changed*/
 
-    lv_subject_set_pointer(subject_sample, &sample);   /*silent again*/
+    lv_subject_set_pointer(subject_raw, &sample);      /*silent again*/
 }
 
-static bool sample_changed_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input,
-                                  const void ** value)
+static bool sample_changed_mapper(lv_subject_t * subject, void * user_data, const void ** value)
 {
     LV_UNUSED(subject);
     sample_watch_t * w = user_data;
-    /*`input` arrives as a union, because a subject's input type need not be the type of
-     *its value. This one is a pointer subject, so read `.pointer`.*/
-    const touch_sample_t * now = input.pointer;
+    /*Reading the raw subject is what registers it as a dependency, so this mapper re-runs
+     *on every publish, and decides for itself whether that is worth telling anyone about.*/
+    const touch_sample_t * now = lv_subject_get_pointer(subject_raw);
     if(now == NULL) return false;
 
     /*Compare the contents, not the pointer, against the copy kept from last time.*/

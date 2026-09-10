@@ -8,7 +8,7 @@ static lv_subject_t * subject_coin;
 static lv_subject_t * subject_total_lazy;
 static lv_subject_t * subject_total_eager;
 
-static bool sum_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value);
+static bool sum_mapper(lv_subject_t * subject, void * user_data, int32_t * value);
 
 /**
  * @title Why a summing mapper needs an eager subject
@@ -84,11 +84,10 @@ void lv_example_observer_13(void)
 
 /*Accumulates, so it is NOT pure: the answer depends on how many times it ran. Safe on an
  *eager subject, wrong on a lazy one.*/
-static bool sum_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+static bool sum_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
-    LV_UNUSED(input);
 
     /*Reading the coin subject is what makes this depend on it*/
     *value += lv_subject_get_int(subject_coin);

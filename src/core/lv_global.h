@@ -126,7 +126,19 @@ typedef struct _lv_global_t {
     lv_ll_t subject_ll;
     lv_subject_t * subject_evaluating;      /**< Subject whose mapper is running, for dependency autowiring */
     lv_timer_t * subject_flush_timer;       /**< Evaluates dirty lazy Subjects once per lv_timer_handler() pass */
-    uint32_t subject_flushing : 1;          /**< Guard so a nested set() does not start a second drain */
+    uint32_t subject_flushing : 4;          /**< Depth of the notification phase. An Observer
+                                             *   may write a Subject, and that write is its own
+                                             *   transaction, which drains inside this one. */
+    uint32_t subject_txn_depth;             /**< Transaction nesting. A bare write is an implicit
+                                             *   transaction, so a write inside an explicit one sees
+                                             *   a depth above 1. */
+    uint32_t subject_txn_id;                /**< Id of the transaction in progress. Stamped into a
+                                             *   Subject's `changed_at` when its value changes. */
+    lv_ll_t subject_txn_writes;             /**< What the transaction has changed so far, for cycle
+                                             *   detection and for rolling back a failed setter */
+    uint32_t subject_txn_aborting : 1;      /**< A setter failed, so the writes are being undone */
+    uint32_t subject_txn_aborted : 1;       /**< The last transaction was rolled back, for
+                                             *   lv_subject_transaction_commit() to report */
 #endif
 
 #if defined(LV_DRAW_SW_SHADOW_CACHE_SIZE) && LV_DRAW_SW_SHADOW_CACHE_SIZE > 0

@@ -15,21 +15,24 @@
  * immediately. `bind_text-fmt` lets a label render a numeric subject through a
  * printf-style format.
  *
- * A subject has no built-in range, so `clamp_0_100` keeps the value in 0..100 no matter
- * who writes it. A mapper owns the subject's value: it is given the value that was just
- * written and returns whether it changed the stored one.
+ * A subject has no built-in range, so the value is clamped by deriving it. The slider
+ * writes `subject_raw`; `subject_value` computes the clamped version of it and is what
+ * everything else reads. A subject with a mapper owns its value, so it is read-only:
+ * writes go to the plain subject its mapper reads.
  */
 
-/* Keeps `subject_value` in 0..100. `value` holds the previously stored value on entry,
- * so keeping a copy of it is all that is needed to report whether anything changed.
- * `input` arrives as a union because a subject's input type need not be the type of its
- * value; here both are integers, so read `.num`. */
-static bool clamp_0_100(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+/* Mirrors `subject_raw`, bounded to 0..100. Every `lv_subject_get_...()` call a mapper
+ * makes registers a dependency, so this re-runs whenever `subject_raw` changes. `value`
+ * holds the previously stored value on entry, which is all that is needed to report
+ * whether anything changed. */
+static lv_subject_t * subject_raw;
+
+static bool clamp_0_100(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
     int32_t before = *value;
-    *value = lv_subject_clamp_int(input.num, 0, 100);
+    *value = lv_subject_clamp_int(lv_subject_get_int(subject_raw), 0, 100);
     return *value != before;
 }
 
@@ -40,10 +43,16 @@ void lv_example_slider_bind_value(void)
     static bool inited = false;
 
     if(!inited) {
+        subject_raw = lv_subject_create(LV_SUBJECT_TYPE_INT);
+        lv_subject_set_int(subject_raw, 50);
+
         subject_value = lv_subject_create(LV_SUBJECT_TYPE_INT);
-        /* Before the first value, so that one is clamped too. */
         lv_subject_set_int_mapper(subject_value, clamp_0_100, NULL);
-        lv_subject_set_int(subject_value, 50);
+
+        /* Declared so `subject_raw` cannot be deleted while this mapper needs it. */
+        static lv_subject_t * clamp_deps[1];
+        clamp_deps[0] = subject_raw;
+        lv_subject_set_static_deps(subject_value, clamp_deps, 1);
         inited = true;
     }
 
@@ -54,10 +63,11 @@ void lv_example_slider_bind_value(void)
     lv_obj_set_style_flex_track_place(screen, LV_FLEX_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_row(screen, 16, 0);
 
-    /* 💡 Drag the slider; the label re-renders because both widgets share `subject_value`. */
+    /* 💡 Drag the slider; it writes `subject_raw` and the label re-renders because
+     * `subject_value` is derived from it. */
     lv_obj_t * slider = lv_slider_create(screen);
     lv_obj_set_width(slider, lv_pct(90));
-    lv_slider_bind_value(slider, subject_value);
+    lv_slider_bind_value(slider, subject_raw);
 
     lv_obj_t * label = lv_label_create(screen);
     lv_label_bind_text(label, subject_value, "Value: %d/100");

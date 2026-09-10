@@ -66,12 +66,6 @@ struct _lv_subject_increment_dsc_t {
 void lv_subject_global_init(void);
 void lv_subject_global_deinit(void);
 
-/**
- * Register `subject` as a dependency of the Subject currently being evaluated, if any.
- * Called by every `lv_subject_get_...()` to wire dependencies automatically.
- * @param subject   the Subject that was just read
- */
-void lv_subject_track_dependency(lv_subject_t * subject);
 
 /**********************
  *      MACROS

@@ -21,10 +21,10 @@ static uint32_t doubled_runs;
 static uint32_t offset_runs;
 static uint32_t total_runs;
 
-static bool doubled_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value);
-static bool offset_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value);
-static bool total_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value);
-static bool report_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, char * buf, size_t size);
+static bool doubled_mapper(lv_subject_t * subject, void * user_data, int32_t * value);
+static bool offset_mapper(lv_subject_t * subject, void * user_data, int32_t * value);
+static bool total_mapper(lv_subject_t * subject, void * user_data, int32_t * value);
+static bool report_mapper(lv_subject_t * subject, void * user_data, char * buf, size_t size);
 
 /**
  * @title A branching dependency graph
@@ -104,11 +104,10 @@ void lv_example_observer_9(void)
                 doubled_runs, offset_runs, total_runs);
 }
 
-static bool doubled_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+static bool doubled_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
-    LV_UNUSED(input);
     doubled_runs++;
 
     int32_t next = lv_subject_get_int(subject_raw) * 2;
@@ -117,11 +116,10 @@ static bool doubled_mapper(lv_subject_t * subject, void * user_data, lv_subject_
     return true;
 }
 
-static bool offset_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+static bool offset_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
-    LV_UNUSED(input);
     offset_runs++;
 
     int32_t next = lv_subject_get_int(subject_raw) + 10;
@@ -132,11 +130,10 @@ static bool offset_mapper(lv_subject_t * subject, void * user_data, lv_subject_v
 
 /*The join. Both branches are read here, so both are dependencies, and both are
  *guaranteed to be up to date and consistent by the time they are read.*/
-static bool total_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, int32_t * value)
+static bool total_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
-    LV_UNUSED(input);
     total_runs++;
 
     int32_t doubled = lv_subject_get_int(subject_doubled);
@@ -157,11 +154,10 @@ static bool total_mapper(lv_subject_t * subject, void * user_data, lv_subject_va
 
 /*A derived string. The mapper gets the buffer, which still holds the previous text, so
  *comparing against it is all that is needed to decide whether anything changed.*/
-static bool report_mapper(lv_subject_t * subject, void * user_data, lv_subject_value_t input, char * buf, size_t size)
+static bool report_mapper(lv_subject_t * subject, void * user_data, char * buf, size_t size)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
-    LV_UNUSED(input);
 
     char next[64];
     lv_snprintf(next, sizeof(next), "2*%" LV_PRId32 " + (%" LV_PRId32 "+10) = %" LV_PRId32,

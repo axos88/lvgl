@@ -68,6 +68,10 @@ lv_subject_delete(width);           /* refused: `area` reads it */
 lv_subject_delete_cascade(width);   /* deletes `area` too, then `width` */
 ```
 
+`lv_subject_delete()` returns `LV_RESULT_OK` when it deleted the Subject and
+`LV_RESULT_INVALID` when it refused, so an application that keeps its own pointer can
+tell whether that pointer is still valid.
+
 Subjects still alive when `lv_deinit()` is called are deleted regardless of their
 dependencies, so shutting an application down needs no ordering.
 
@@ -89,6 +93,53 @@ Read the current value back with `lv_subject_get_...()` (e.g. <ApiLink name="lv_
 lv_subject_set_int(temperature, 25);            /* notifies observers */
 int32_t t = lv_subject_get_int(temperature);    /* -> 25 */
 ```
+
+An `int` Subject and a `float` one can each be read and written as the other type, so a
+widget or an expression does not have to know which it was declared as. An `int` read as
+a `float` is exact. The other way has to decide what happens to the fraction, and
+<ApiLink name="lv_subject_set_rounding" display="lv_subject_set_rounding()" /> says
+which; the default rounds to the nearest, because truncating would show 4.9 as 4.
+
+```c
+lv_subject_set_float(temperature, 21.7f);
+lv_subject_get_int(temperature);                             /* -> 22 */
+
+lv_subject_set_rounding(temperature, LV_SUBJECT_ROUND_TOWARD_ZERO);
+lv_subject_get_int(temperature);                             /* -> 21 */
+```
+
+The rule belongs to the Subject and applies in both directions, so it also decides what
+`lv_subject_set_float()` stores in an `int` Subject.
+
+`LV_SUBJECT_ROUND_EXACT` is the third choice, and it asks for something stronger: every
+conversion has to be lossless. A write that is not is **refused**, and the Subject keeps
+the value it had.
+
+```c
+lv_subject_set_rounding(count, LV_SUBJECT_ROUND_EXACT);
+lv_subject_set_float(count, 2.7f);      /* refused, `count` is unchanged */
+lv_subject_set_float(count, 3.0f);      /* stored */
+```
+
+That covers the other direction too. A `float` holds every `int32_t` exactly only up to
+<ApiLink name="LV_SUBJECT_INT_EXACT_IN_FLOAT" /> (2<sup>24</sup>); above it the low bits
+go, so under `LV_SUBJECT_ROUND_EXACT` writing such an `int` into a `float` Subject is
+refused as well.
+
+A read cannot be refused, because `lv_subject_get_int()` returns the value itself. It
+answers with the nearest integer and warns. To be told instead, use
+<ApiLink name="lv_subject_get_int_checked" display="lv_subject_get_int_checked()" /> or
+<ApiLink name="lv_subject_get_float_checked" display="lv_subject_get_float_checked()" />:
+
+```c
+int32_t v;
+if(lv_subject_get_int_checked(temperature, &v) == LV_RESULT_INVALID) {
+    /* v holds the rounded value, but the Subject was not a whole number */
+}
+```
+
+Those two report the truth whatever the rounding mode is: the mode decides which integer
+you get, the result says whether that integer is the whole story.
 
 Strings are copied into the Subject's own buffer, so update them with
 <ApiLink name="lv_subject_copy_string" display="lv_subject_copy_string()" />:

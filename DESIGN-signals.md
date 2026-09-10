@@ -90,9 +90,16 @@ and is not eager is due for nothing, and is deliberately kept out of the prefix.
 ### 1.5 Deleting
 
 `lv_subject_delete()` refuses while another subject's mapper reads the target, because
-that would leave the mapper without an input. `lv_subject_delete_cascade()` takes the
-transitive dependents with it, like SQL's `ON DELETE CASCADE`. `lv_deinit()` cascades
-from the head one at a time, so no ordering has to be worked out.
+that would leave the mapper without an input. It returns `LV_RESULT_INVALID` when it
+refuses and `LV_RESULT_OK` when it deletes, so the caller can tell whether it still owns
+the subject. `lv_subject_delete_cascade()` takes the transitive dependents with it, like
+SQL's `ON DELETE CASCADE`. `lv_deinit()` cascades from the head one at a time, so no
+ordering has to be worked out.
+
+`lv_subject_set_delete_cb()` is how an application that keeps its own pointers hears
+about any of these paths. That is the difference the demo shows: a mapper input cannot be
+deleted from under its reader, while a plain subject that observers compute can, and then
+every pointer to it is the application's own problem.
 
 ### 1.6 Pointer values
 
@@ -482,9 +489,23 @@ Scope worth holding to:
 | string results via a `format` shape | arbitrary string manipulation |
 
 Details that need a decision rather than a guess: integer division by zero (generate a
-guard, or refuse at codegen when the divisor is a literal zero), int/float promotion
-rules, and whether comparison results are `0/1` ints or a distinct bool type. None is
-hard; all are choices worth making once and writing down.
+guard, or refuse at codegen when the divisor is a literal zero) and whether comparison
+results are `0/1` ints or a distinct bool type. None is hard; all are choices worth
+making once and writing down.
+
+Int/float promotion is settled. A Subject of either type can be read and written as the
+other, so an expression and a widget both stop caring which one was declared. An `int`
+read as a `float` is exact; a `float` read as an `int` follows the Subject's
+`lv_subject_set_rounding()` mode, which rounds to the nearest by default and can
+truncate instead. That is what removed the `if(type == INT) … else …` pair from every
+widget that binds a value.
+
+`LV_SUBJECT_ROUND_EXACT` is the strict mode: it requires every conversion to be
+lossless, refuses a write that is not, and warns on a read. Both directions can lose
+something — a float carrying a fraction, and an `int32_t` past 2^24 that a float's
+24-bit mantissa cannot hold — and it covers both. A read cannot be refused, since the
+getter returns the value, so `lv_subject_get_int_checked()` and
+`lv_subject_get_float_checked()` report it through an `lv_result_t` instead.
 
 A recursive-descent parser over that grammar is a few hundred lines in the existing
 Python codegen, and the `<mapper name="..."/>` escape hatch stays for whatever the

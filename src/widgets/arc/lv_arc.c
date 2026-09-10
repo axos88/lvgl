@@ -1202,14 +1202,18 @@ static void arc_value_changed_event_cb(lv_event_t * e)
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT);
 
-    if(subject->type == LV_SUBJECT_TYPE_INT) {
-        lv_subject_set_int(subject, lv_arc_get_value(arc));
-    }
-#if LV_USE_FLOAT
-    else {
-        lv_subject_set_float(subject, (float)lv_arc_get_value(arc));
-    }
-#endif
+    /* An int Subject and a float one take the same call: the Subject converts, by the
+     * rounding rule it carries. */
+    lv_subject_set_int(subject, lv_arc_get_value(arc));
+
+    /* A Subject with a setter decides for itself what a write means: it may land
+     * somewhere else, or nowhere at all when the value it computes cannot move. Nothing
+     * notifies when the value did not change, so without this the widget would keep the
+     * position the user dragged it to while the Subject says otherwise. Putting the
+     * Subject's value back is what makes a two-way binding snap back honestly.
+     *
+     * `lv_arc_set_value()` sends no LV_EVENT_VALUE_CHANGED, so this cannot loop. */
+    lv_arc_set_value(arc, lv_subject_get_int(subject));
 }
 
 static void arc_value_observer_cb(lv_observer_t * observer, lv_subject_t * subject)
@@ -1218,14 +1222,7 @@ static void arc_value_observer_cb(lv_observer_t * observer, lv_subject_t * subje
     LV_ASSERT(lv_observer_get_target_obj(observer) != NULL);
     LV_ASSERT(subject != NULL);
     LV_ASSERT(subject->type == LV_SUBJECT_TYPE_INT || subject->type == LV_SUBJECT_TYPE_FLOAT);
-    if(subject->type == LV_SUBJECT_TYPE_INT) {
-        lv_arc_set_value(lv_observer_get_target_obj(observer), subject->value.num);
-    }
-#if LV_USE_FLOAT
-    else {
-        lv_arc_set_value(lv_observer_get_target_obj(observer), (int32_t)subject->value.float_v);
-    }
-#endif
+    lv_arc_set_value(lv_observer_get_target_obj(observer), lv_subject_get_int(subject));
 }
 
 #endif /*LV_USE_OBSERVER*/

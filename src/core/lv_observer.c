@@ -20,6 +20,60 @@
 
 
 #define subject_list LV_GLOBAL_DEFAULT()->subject_ll
+
+/*---------------------------------------------------------------------------
+ * The registry
+ *
+ * An `lv_subject_id_t` is a slot index and that slot's generation, packed into one
+ * word. Resolving compares the generation, so an id outlives its Subject safely: it
+ * simply stops resolving. A slot whose generation is about to wrap is retired rather
+ * than reused, which makes a stale id resolving to a later Subject impossible rather
+ * than merely unlikely.
+ *-------------------------------------------------------------------------*/
+
+#define SUBJECT_SLOT_MAX 0xFFFFu
+#define SUBJECT_GEN_MAX  0xFFFFu
+
+typedef struct {
+    lv_subject_t * subject;   /**< NULL once the Subject is deleted */
+    uint16_t gen;             /**< Bumped on release; 0 means the slot is retired */
+} subject_slot_t;
+
+static lv_subject_id_t subject_id_make(uint32_t slot, uint32_t gen)
+{
+    lv_subject_id_t id = { (uint16_t)slot, (uint16_t)gen };
+    return id;
+}
+
+/* Make sure slot `want` exists. Slots created here are free and on generation 1, which
+ * is the generation a first occupant is given. */
+static bool slots_reach(uint32_t want)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    if(want > SUBJECT_SLOT_MAX) return false;
+
+    if(global->subject_slot_cap <= want) {
+        uint32_t cap = global->subject_slot_cap == 0 ? 8 : global->subject_slot_cap;
+        while(cap <= want) cap *= 2;
+        subject_slot_t * grown = lv_realloc(global->subject_slots, cap * sizeof(subject_slot_t));
+        LV_ASSERT_MALLOC(grown);
+        if(grown == NULL) return false;
+        lv_memzero(grown + global->subject_slot_cap,
+                   (cap - global->subject_slot_cap) * sizeof(subject_slot_t));
+        global->subject_slots = grown;
+        global->subject_slot_cap = cap;
+    }
+
+    subject_slot_t * slots = global->subject_slots;
+    /* Slot 0 is reserved, so the table always starts at 1. */
+    if(global->subject_slot_cnt == 0) global->subject_slot_cnt = 1;
+    while(global->subject_slot_cnt <= want) {
+        slots[global->subject_slot_cnt].subject = NULL;
+        slots[global->subject_slot_cnt].gen = 1;
+        global->subject_slot_cnt++;
+    }
+    return true;
+}
 #define txn_writes LV_GLOBAL_DEFAULT()->subject_txn_writes
 
 /* How deep a chain of Observers writing Subjects may go before it is cut. */
@@ -164,8 +218,6 @@ static bool txn_setter_write_ok(lv_subject_t * subject, lv_subject_value_t v);
 static bool run_setter(lv_subject_t * subject, lv_subject_value_t value);
 static bool mapped_write(lv_subject_t * subject, lv_subject_value_t value);
 static bool copy_write_handled(lv_subject_t * subject, const void * data, bool * ok);
-static bool static_deps_contain(const lv_subject_t * subject, const lv_subject_t * dep);
-static void static_deps_release(lv_subject_t * subject);
 /* Release a pointer, but only if the Subject owns it and nothing refers to it any more.
  *
  * A Subject refers to a pointer from two places: the value it stores and the input it
@@ -231,6 +283,10 @@ void lv_subject_global_init(void)
     global->subject_txn_depth = 0;
     global->subject_txn_id = 0;
     global->subject_txn_aborting = 0;
+    global->subject_eval_failed = 0;
+    global->subject_slots = NULL;
+    global->subject_slot_cnt = 0;
+    global->subject_slot_cap = 0;
     lv_ll_init(&subject_list, sizeof(lv_subject_t));
     lv_ll_init(&txn_writes, sizeof(txn_write_t));
 }
@@ -252,6 +308,13 @@ void lv_subject_global_deinit(void)
     while((curr = lv_ll_get_head(&subject_list)) != NULL) {
         lv_subject_delete_cascade(curr);
     }
+
+    /* Every Subject has gone, so no id can be resolved any more and the table has
+     * nothing left to describe. */
+    lv_free(global->subject_slots);
+    global->subject_slots = NULL;
+    global->subject_slot_cnt = 0;
+    global->subject_slot_cap = 0;
 }
 
 /*---------------------------------------------------------------
@@ -262,20 +325,199 @@ void lv_subject_global_deinit(void)
  * steady-state re-evaluation does not allocate.
  *--------------------------------------------------------------*/
 
+/* An evaluation asked for a Subject that is gone, or read one that is itself errored.
+ *
+ * Only meaningful while a mapper or setter is running: outside one there is no evaluation
+ * to invalidate, and an Observer reading a deleted Subject is the application's own
+ * business. `notify()` clears `subject_evaluating`, so Observer callbacks never land
+ * here. */
+static void eval_note_missing(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    if(global->subject_evaluating != NULL) global->subject_eval_failed = 1;
+}
+
+/* A write that could not reach its Subject.
+ *
+ * Reading something that is gone gives a reader a wrong answer, and marking it errored is
+ * enough. A *write* is different: it was meant to change something and did not, so every
+ * other write meant to go with it is now half of an intention. The transaction is failed
+ * here and rolled back at the commit, rather than at once, so the caller's remaining
+ * writes still run and the rollback happens in one place. */
+static void write_target_missing(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+
+    eval_note_missing();
+    if(global->subject_txn_depth > 0) {
+        global->subject_txn_failed = 1;
+    }
+    else {
+        LV_LOG_WARN("Wrote a Subject that no longer exists. Nothing was changed.");
+    }
+}
+
+/* Resolve for an accessor: NULL, and a note against the running evaluation, when the
+ * Subject is gone or is not trustworthy. */
+static lv_subject_t * resolve_for_read(lv_subject_id_t id)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    if(subject == NULL) {
+        eval_note_missing();
+        return NULL;
+    }
+
+    /* Settle it before judging it. A lazy Subject whose dependency has changed has not
+     * run yet, so its `errored` flag still describes the evaluation before last; asking
+     * first would let a reader treat a stale answer as a good one. */
+    subject_pull(subject);
+    if(subject->errored) {
+        /* Still an edge. The read failed, but this Subject exists and may recover, and
+         * without the edge nothing would mark the reader dirty when it does — leaving
+         * the reader errored for ever over a dependency that came back. */
+        lv_subject_track_dependency(subject);
+        eval_note_missing();
+        return NULL;
+    }
+    return subject;
+}
+
+uint32_t lv_subject_report_errors(void)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    const subject_slot_t * slots = global->subject_slots;
+    uint32_t found = 0;
+
+    for(uint32_t i = 1; i < global->subject_slot_cnt; i++) {
+        const lv_subject_t * subject = slots[i].subject;
+        if(subject == NULL || !subject->errored) continue;
+
+        if(found == 0) {
+            LV_LOG_WARN("Subjects whose last evaluation read something that is gone:");
+        }
+        found++;
+        /* The id rather than the pointer, because that is what the application holds and
+         * what it can look up. The name is not the library's to know. */
+        LV_LOG_WARN("  slot %" LV_PRIu32 " generation %" LV_PRIu32 ", %" LV_PRIu32
+                    " dependent(s)", (uint32_t)subject->id.slot, (uint32_t)subject->id.gen,
+                    ref_list_count(&subject->dependents));
+    }
+    return found;
+}
+
+bool lv_subject_has_error(lv_subject_id_t id)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    /* A Subject that is gone is not trustworthy either, which is the same answer a
+     * caller needs. */
+    if(subject == NULL) return true;
+
+    /* The question is about the value a reader would get now, and a lazy Subject has not
+     * necessarily run since its dependency changed. Settle it first, exactly as a read
+     * of the value would. */
+    subject_pull(subject);
+    return subject->errored;
+}
+
+
+/*---------------------------------------------------------------------------
+ * Reaching a Subject indirectly, by id
+ *
+ * The same accessors, but they take a registry id and resolve it themselves. A read of
+ * a Subject that has been deleted returns the fallback and marks the evaluation that
+ * made it, rather than following a pointer into freed memory. That is what lets a
+ * mapper name a Subject it may not read on every branch, with no declaration to keep
+ * in step.
+ *-------------------------------------------------------------------------*/
+int32_t lv_subject_indirect_get_int(lv_subject_id_t id)
+{
+    lv_subject_t * subject = resolve_for_read(id);
+    if(subject == NULL) return 0;
+    return lv_subject_get_int(subject);
+}
+#if LV_USE_FLOAT
+float lv_subject_indirect_get_float(lv_subject_id_t id)
+{
+    lv_subject_t * subject = resolve_for_read(id);
+    if(subject == NULL) return 0.0f;
+    return lv_subject_get_float(subject);
+}
+#endif
+lv_color_t lv_subject_indirect_get_color(lv_subject_id_t id)
+{
+    lv_subject_t * subject = resolve_for_read(id);
+    if(subject == NULL) return lv_color_black();
+    return lv_subject_get_color(subject);
+}
+const char * lv_subject_indirect_get_string(lv_subject_id_t id)
+{
+    lv_subject_t * subject = resolve_for_read(id);
+    if(subject == NULL) return NULL;
+    return lv_subject_get_string(subject);
+}
+const void * lv_subject_indirect_get_pointer(lv_subject_id_t id)
+{
+    lv_subject_t * subject = resolve_for_read(id);
+    if(subject == NULL) return NULL;
+    return lv_subject_get_pointer(subject);
+}
+void lv_subject_indirect_set_int(lv_subject_id_t id, int32_t value)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    if(subject == NULL) {
+        write_target_missing();
+        return;
+    }
+    lv_subject_set_int(subject, value);
+}
+#if LV_USE_FLOAT
+void lv_subject_indirect_set_float(lv_subject_id_t id, float value)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    if(subject == NULL) {
+        write_target_missing();
+        return;
+    }
+    lv_subject_set_float(subject, value);
+}
+#endif
+void lv_subject_indirect_set_color(lv_subject_id_t id, lv_color_t value)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    if(subject == NULL) {
+        write_target_missing();
+        return;
+    }
+    lv_subject_set_color(subject, value);
+}
+void lv_subject_indirect_set_string(lv_subject_id_t id, const char * value)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    if(subject == NULL) {
+        write_target_missing();
+        return;
+    }
+    lv_subject_set_string(subject, value);
+}
+void lv_subject_indirect_set_pointer(lv_subject_id_t id, void * value)
+{
+    lv_subject_t * subject = lv_subject_get(id);
+    if(subject == NULL) {
+        write_target_missing();
+        return;
+    }
+    lv_subject_set_pointer(subject, value);
+}
+uint32_t lv_subject_indirect_get_changed_at(lv_subject_id_t id)
+{
+    lv_subject_t * subject = resolve_for_read(id);
+    return subject == NULL ? 0 : lv_subject_get_changed_at(subject);
+}
+
 void lv_subject_track_dependency(lv_subject_t * subject)
 {
     lv_subject_t * reader = LV_GLOBAL_DEFAULT()->subject_evaluating;
     if(reader == NULL || reader == subject) return;
-
-    /* A mapper reading something it never declared is the use-after-free arriving by
-     * another route: that Subject looks deletable to `lv_subject_delete()`. Only checked
-     * once a declaration exists, so a hand-written mapper that declares nothing is left
-     * alone. */
-    if(reader->static_deps != NULL && !static_deps_contain(reader, subject)) {
-        LV_LOG_WARN("A mapper read a Subject that is not in its static dependencies, so that "
-                    "Subject can still be deleted while this one needs it. Add it to the list "
-                    "passed to lv_subject_set_static_deps().");
-    }
 
     /* Already wired from an earlier read in the same evaluation? */
     if(ref_list_contains(&reader->deps, subject)) return;
@@ -433,43 +675,6 @@ bool lv_subject_is_writable(const lv_subject_t * subject)
     return !subject->has_mapper || subject->has_setter;
 }
 
-/* Drop the references a Subject's static declaration holds on other Subjects. */
-static void static_deps_release(lv_subject_t * subject)
-{
-    for(uint32_t i = 0; i < subject->static_dep_cnt; i++) {
-        lv_subject_t * dep = subject->static_deps[i];
-        if(dep != NULL && dep->static_ref_cnt > 0) dep->static_ref_cnt--;
-    }
-    subject->static_deps = NULL;
-    subject->static_dep_cnt = 0;
-}
-
-/* Is `dep` one of the Subjects `subject` declared? */
-static bool static_deps_contain(const lv_subject_t * subject, const lv_subject_t * dep)
-{
-    for(uint32_t i = 0; i < subject->static_dep_cnt; i++) {
-        if(subject->static_deps[i] == dep) return true;
-    }
-    return false;
-}
-
-void lv_subject_set_static_deps(lv_subject_t * subject, lv_subject_t * const * deps, uint32_t count)
-{
-    LV_CHECK_ARG(subject != NULL, return);
-    LV_CHECK_ARG(deps != NULL || count == 0, return);
-
-    static_deps_release(subject);
-    if(deps == NULL || count == 0) return;
-
-    subject->static_deps = deps;
-    subject->static_dep_cnt = count;
-
-    /* Each named Subject now has a reason to stay alive. */
-    for(uint32_t i = 0; i < count; i++) {
-        if(deps[i] != NULL) deps[i]->static_ref_cnt++;
-    }
-}
-
 void lv_subject_set_float_mapper(lv_subject_t * subject, lv_subject_float_mapper_t mapper, void * user_data)
 {
     if(!set_mapper_allowed(subject, LV_SUBJECT_TYPE_FLOAT)) return;
@@ -548,7 +753,9 @@ lv_result_t lv_subject_transaction_commit(void)
         return LV_RESULT_INVALID;
     }
     txn_leave();
-    return LV_RESULT_OK;
+    /* txn_leave() rolls back instead of committing when a write could not reach its
+     * Subject, so the answer is not known until it returns. */
+    return global->subject_txn_aborted ? LV_RESULT_INVALID : LV_RESULT_OK;
 }
 
 uint32_t lv_subject_get_changed_at(lv_subject_t * subject)
@@ -574,7 +781,131 @@ void lv_subject_flush(void)
 }
 
 
-lv_subject_t * lv_subject_create(lv_subject_type_t type)
+/* Take a slot for a new Subject. Reuses a released slot when there is one, because a
+ * program that creates and deletes Subjects steadily would otherwise grow the table for
+ * ever. Returns LV_SUBJECT_ID_NONE if the table cannot grow. */
+static lv_subject_id_t slot_acquire(lv_subject_t * subject)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+
+    /* Slot 0 is reserved, so that a zeroed id is always the invalid one. */
+    if(global->subject_slot_cnt == 0) {
+        global->subject_slot_cap = 8;
+        global->subject_slots = lv_malloc_zeroed(global->subject_slot_cap * sizeof(subject_slot_t));
+        LV_ASSERT_MALLOC(global->subject_slots);
+        if(global->subject_slots == NULL) {
+            global->subject_slot_cap = 0;
+            return LV_SUBJECT_ID_NONE;
+        }
+        global->subject_slot_cnt = 1;
+    }
+
+    subject_slot_t * slots = global->subject_slots;
+    for(uint32_t i = 1; i < global->subject_slot_cnt; i++) {
+        subject_slot_t * slot = &slots[i];
+        /* Free, and not retired. A retired slot has generation 0 and is never handed out
+         * again, so an id from before the wrap cannot come back to life. */
+        if(slot->subject == NULL && slot->gen != 0) {
+            slot->subject = subject;
+            return subject_id_make(i, slot->gen);
+        }
+    }
+
+    if(global->subject_slot_cnt > SUBJECT_SLOT_MAX) {
+        LV_LOG_WARN("More than %" LV_PRIu32 " Subjects exist at once, which is the most the "
+                    "registry can address.", (uint32_t)SUBJECT_SLOT_MAX);
+        return LV_SUBJECT_ID_NONE;
+    }
+
+    if(global->subject_slot_cnt == global->subject_slot_cap) {
+        uint32_t want = global->subject_slot_cap * 2;
+        subject_slot_t * grown = lv_realloc(global->subject_slots, want * sizeof(subject_slot_t));
+        LV_ASSERT_MALLOC(grown);
+        if(grown == NULL) return LV_SUBJECT_ID_NONE;
+        lv_memzero(grown + global->subject_slot_cap,
+                   (want - global->subject_slot_cap) * sizeof(subject_slot_t));
+        global->subject_slots = grown;
+        global->subject_slot_cap = want;
+        slots = grown;
+    }
+
+    uint32_t i = global->subject_slot_cnt++;
+    slots[i].subject = subject;
+    slots[i].gen = 1;
+    return subject_id_make(i, 1);
+}
+
+/* Give the slot back. The generation moves on, so every id handed out for the Subject
+ * that just went stops resolving. */
+static void slot_release(lv_subject_id_t id)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    uint32_t i = id.slot;
+    if(i == 0 || i >= global->subject_slot_cnt) return;
+
+    subject_slot_t * slot = &((subject_slot_t *)global->subject_slots)[i];
+    slot->subject = NULL;
+    /* Out of generations: retire the slot rather than start again at 1, which would let
+     * an ancient id address whatever is created next. */
+    slot->gen = slot->gen >= SUBJECT_GEN_MAX ? 0 : (uint16_t)(slot->gen + 1);
+}
+
+lv_subject_t * lv_subject_get(lv_subject_id_t id)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+    uint32_t i = id.slot;
+    if(i == 0 || i >= global->subject_slot_cnt) return NULL;
+
+    const subject_slot_t * slot = &((const subject_slot_t *)global->subject_slots)[i];
+    if(slot->gen != id.gen) return NULL;
+    return slot->subject;
+}
+
+lv_subject_id_t lv_subject_get_id(const lv_subject_t * subject)
+{
+    LV_CHECK_ARG(subject != NULL, return LV_SUBJECT_ID_NONE);
+    return subject->id;
+}
+
+/* Take the slot `id` names, or say why not.
+ *
+ * The generated code gives each Subject a fixed id so an expression can refer to it as a
+ * constant. That only holds if the slot is really free and really on the generation the
+ * constant was written for, so every other case is refused rather than quietly moved. */
+static bool slot_claim(lv_subject_id_t id, lv_subject_t * subject)
+{
+    lv_global_t * global = LV_GLOBAL_DEFAULT();
+
+    if(id.slot == 0) {
+        LV_LOG_WARN("Slot 0 is reserved, so it is never a valid Subject id.");
+        return false;
+    }
+    if(!slots_reach(id.slot)) return false;
+
+    subject_slot_t * slot = &((subject_slot_t *)global->subject_slots)[id.slot];
+    if(slot->subject != NULL) {
+        LV_LOG_WARN("Slot %" LV_PRIu32 " already holds a Subject. Two Subjects cannot share "
+                    "a fixed id.", (uint32_t)id.slot);
+        return false;
+    }
+    if(slot->gen == 0) {
+        LV_LOG_WARN("Slot %" LV_PRIu32 " is retired: its generations ran out, so it is never "
+                    "handed out again.", (uint32_t)id.slot);
+        return false;
+    }
+    if(slot->gen != id.gen) {
+        LV_LOG_WARN("Slot %" LV_PRIu32 " is on generation %" LV_PRIu32 ", not %" LV_PRIu32
+                    ". That generation is used up: a Subject deleted from this slot cannot "
+                    "be recreated with the same id.",
+                    (uint32_t)id.slot, (uint32_t)slot->gen, (uint32_t)id.gen);
+        return false;
+    }
+
+    slot->subject = subject;
+    return true;
+}
+
+static lv_subject_t * subject_create_common(lv_subject_type_t type, const lv_subject_id_t * at)
 {
     LV_CHECK_ARG(type != LV_SUBJECT_TYPE_INVALID, return NULL);
     LV_CHECK_ARG(LV_USE_FLOAT || type != LV_SUBJECT_TYPE_FLOAT, return NULL);
@@ -587,6 +918,17 @@ lv_subject_t * lv_subject_create(lv_subject_type_t type)
     init_common(subject);
     subject->in_list = 1;
     subject->type = (uint32_t)type;
+    if(at != NULL) {
+        if(!slot_claim(*at, subject)) {
+            lv_ll_remove(&subject_list, subject);
+            lv_free(subject);
+            return NULL;
+        }
+        subject->id = *at;
+    }
+    else {
+        subject->id = slot_acquire(subject);
+    }
 
     switch(type) {
         case LV_SUBJECT_TYPE_INT:
@@ -618,11 +960,24 @@ lv_subject_t * lv_subject_create(lv_subject_type_t type)
     return subject;
 }
 
+lv_subject_t * lv_subject_create(lv_subject_type_t type)
+{
+    return subject_create_common(type, NULL);
+}
+
+lv_subject_t * lv_subject_create_with_id(lv_subject_type_t type, lv_subject_id_t id)
+{
+    return subject_create_common(type, &id);
+}
+
 /* Tear down and free, with no dependency check. The caller has to have established
  * that nothing depends on `subject`, or be deleting the whole graph. */
 static void subject_destroy(lv_subject_t * subject)
 {
     deinit(subject);
+    /* Before the free, so every id for this Subject stops resolving at the same moment
+     * the memory stops being valid. */
+    slot_release(subject->id);
     lv_ll_remove(&subject_list, subject);
     lv_free(subject);
 }
@@ -636,16 +991,6 @@ lv_result_t lv_subject_delete(lv_subject_t * subject)
         LV_LOG_WARN("Use lv_subject_deinit() for a Subject set up with lv_subject_init_...()");
         return LV_RESULT_INVALID;
     }
-    /* The declared edges first. They cover every branch, so they catch the Subject that
-     * happens to be unread right now but would be read after a condition flips. */
-    if(subject->static_ref_cnt > 0) {
-        LV_LOG_WARN("Subject is named in the static dependencies of %" LV_PRIu32 " other "
-                    "Subject(s), so deleting it could leave a mapper or setter reaching freed "
-                    "memory. Delete those first, or use lv_subject_delete_cascade().",
-                    subject->static_ref_cnt);
-        return LV_RESULT_INVALID;
-    }
-
     uint32_t dependents = ref_list_count(&subject->dependents);
     if(dependents > 0) {
         LV_LOG_WARN("Subject is a dependency of %" LV_PRIu32 " other Subject(s). Delete those "
@@ -682,6 +1027,23 @@ void * lv_subject_get_mapper_user_data(const lv_subject_t * subject)
     LV_CHECK_ARG(subject != NULL, return NULL);
 
     return subject->mapper_user_data;
+}
+
+lv_result_t lv_subject_delete_forced(lv_subject_t * subject)
+{
+    if(!subject) {
+        return LV_RESULT_INVALID;
+    }
+    if(!subject->in_list) {
+        LV_LOG_WARN("Use lv_subject_deinit() for a Subject set up with lv_subject_init_...()");
+        return LV_RESULT_INVALID;
+    }
+
+    /* Everything that reads this has to look again, and will find it gone. Marked before
+     * the teardown, because the teardown is what removes the edges this walks. */
+    mark_dependents_dirty(subject);
+    subject_destroy(subject);
+    return LV_RESULT_OK;
 }
 
 void lv_subject_delete_cascade(lv_subject_t * subject)
@@ -2097,6 +2459,9 @@ static void edges_teardown(lv_subject_t * subject)
     subject_ref_t * ref = lv_ll_get_head(&subject->dependents);
     while(ref) {
         subject_ref_t * next = lv_ll_get_next(&subject->dependents, ref);
+        /* This edge is about to disappear, so its reader must not decide it has nothing
+         * to do by looking at the edges that remain. */
+        ref->subject->force_eval = 1;
         ref_list_remove(&ref->subject->deps, subject);
         lv_ll_remove(&subject->dependents, ref);
         lv_free(ref);
@@ -2300,8 +2665,9 @@ static void txn_enter(void)
      * id, so Subjects changed together compare equal. */
     if(global->subject_txn_depth == 0) {
         global->subject_txn_id++;
-        /* The flag describes the transaction now starting, not the one before it. */
+        /* The flags describe the transaction now starting, not the one before it. */
         global->subject_txn_aborted = 0;
+        global->subject_txn_failed = 0;
     }
     global->subject_txn_depth++;
 }
@@ -2313,6 +2679,15 @@ static void txn_leave(void)
 
     global->subject_txn_depth--;
     if(global->subject_txn_depth > 0) return;   /* an inner commit notifies nothing */
+
+    /* A write could not reach its Subject. Committing now would keep the writes that did
+     * land, which is exactly the half-applied change a transaction exists to prevent. */
+    if(global->subject_txn_failed) {
+        LV_LOG_WARN("A write in this transaction could not reach its Subject, so the whole "
+                    "transaction is rolled back.");
+        txn_abort();
+        return;
+    }
 
     /* Committed, so the values the transaction replaced are finally unreachable and the
      * releases it held back can happen. */
@@ -2495,6 +2870,7 @@ static void txn_abort(void)
     flush_timer_update();
     global->subject_txn_depth = 0;
     global->subject_txn_aborting = 0;
+    global->subject_txn_failed = 0;
     /* Nothing is left to commit, and the caller has no other way to learn that. */
     global->subject_txn_aborted = 1;
 }
@@ -2559,7 +2935,9 @@ static bool mapped_write(lv_subject_t * subject, lv_subject_value_t value)
     }
 
     txn_enter();
-    if(!run_setter(subject, value)) {
+    bool ok = run_setter(subject, value);
+    /* The setter may have returned true while one of its writes went nowhere. */
+    if(!ok || LV_GLOBAL_DEFAULT()->subject_txn_failed) {
         txn_abort();
         return false;
     }
@@ -2710,6 +3088,12 @@ static bool run_mapper(lv_subject_t * subject)
     lv_subject_t * outer = global->subject_evaluating;
     void * ud = subject->mapper_user_data;
 
+    /* The flag belongs to this evaluation, so it is taken fresh and the outer one is put
+     * back afterwards: a mapper that reads a dependency evaluates it inside this call,
+     * and that inner failure must not be lost or leak outwards. */
+    uint32_t outer_failed = global->subject_eval_failed;
+    global->subject_eval_failed = 0;
+
     subject->evaluating = 1;
     global->subject_evaluating = subject;
     deps_clear(subject);
@@ -2757,6 +3141,27 @@ static bool run_mapper(lv_subject_t * subject)
      * which evaluates that dependency inside this one. */
     global->subject_evaluating = outer;
     subject->evaluating = 0;
+
+    /* A Subject that read something missing is not trustworthy, so it keeps the value it
+     * last computed properly and says so. Marked afresh every time rather than latched:
+     * when the branch that needed the missing Subject is no longer taken, the next
+     * evaluation succeeds and clears it without anyone intervening. */
+    subject->errored = global->subject_eval_failed ? 1 : 0;
+    if(subject->errored) {
+        /* The value it just computed is published even though a read inside it failed.
+         *
+         * Withholding it was the obvious thing and it is wrong: a Subject usually reads
+         * several others, and the ones still there keep changing. A label built from the
+         * hour and the minute would stop following the hour as well once the minute went,
+         * which is worse than showing the hour beside a missing minute. `errored` is how
+         * a reader is told not to trust the value; refusing to move it as well only
+         * hides the half that still works.
+         *
+         * A read of a missing Subject returns zero, so what gets published is defined,
+         * not leftover. */
+        if(outer != NULL) outer_failed = 1;   /* the reader is no more trustworthy */
+    }
+    global->subject_eval_failed = outer_failed;
     return changed;
 }
 
@@ -2800,9 +3205,16 @@ static void subject_evaluate(lv_subject_t * subject)
 
     void * outgoing = (void *)subject->value.pointer;
     bool outgoing_owned = subject->owns_value;
+    bool was_errored = subject->errored;
 
     txn_record_change(subject);
     bool changed = run_mapper(subject);
+
+    /* Becoming errored, or stopping being errored, is a change in its own right even when
+     * the value is identical: the Subject's value is frozen while it is errored, so a
+     * reader that saw the old one has to look again, and an Observer that asks
+     * `lv_subject_has_error()` would otherwise never be told. */
+    if(subject->errored != was_errored) changed = true;
 
     if(subject->type == LV_SUBJECT_TYPE_POINTER || subject->type == LV_SUBJECT_TYPE_STRING) {
         /* A mapper cannot take ownership of anything: what it produced is borrowed unless
@@ -2867,6 +3279,13 @@ static void subject_write(lv_subject_t * subject, lv_subject_value_t v, const vo
  * a write, which never reaches a Subject that has a mapper. */
 static bool deps_are_unchanged(lv_subject_t * subject)
 {
+    /* Something it read has gone. What is left may look untouched, so the only honest
+     * answer is to run and find out. */
+    if(subject->force_eval) {
+        subject->force_eval = 0;
+        return false;
+    }
+
     uint32_t dep_cnt = ref_list_count(&subject->deps);
     if(dep_cnt == 0) return false;   /* nothing recorded yet, so it has to run */
 
@@ -3353,7 +3772,6 @@ static void deinit(lv_subject_t * subject)
     /* Both directions, so deleting a Subject in the middle of a graph leaves no
      * dangling edge in its dependencies or its dependents. */
     edges_teardown(subject);
-    static_deps_release(subject);
     subject->has_mapper = 0;
     subject->dirty = 0;
     subject->pending_notify = 0;

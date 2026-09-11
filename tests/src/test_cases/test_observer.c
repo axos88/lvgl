@@ -6,18 +6,22 @@
 
 static uint32_t observer_called = 0;
 
-/* Subjects are owned by LVGL now, so every test registers the ones it creates
- * here and tearDown() deletes them. */
-static lv_subject_t * subjects[16] = {NULL};
+/* Subjects are owned by LVGL now, so every test registers the ones it creates here and
+ * tearDown() deletes them.
+ *
+ * Ids rather than pointers, so a Subject a test deletes by any route — on its own, or
+ * swept up by a cascade — simply stops resolving here and needs no bookkeeping. */
+static lv_subject_id_t subjects[16];
 
 /* Create a Subject and register it for automatic deletion in tearDown(). */
 static lv_subject_t * subject_create(lv_subject_type_t type)
 {
     for(size_t i = 0; i < LV_ARRAYLEN(subjects); ++i) {
-        if(subjects[i] == NULL) {
-            subjects[i] = lv_subject_create(type);
-            TEST_ASSERT_NOT_NULL(subjects[i]);
-            return subjects[i];
+        if(!lv_subject_id_valid(subjects[i])) {
+            lv_subject_t * subject = lv_subject_create(type);
+            TEST_ASSERT_NOT_NULL(subject);
+            subjects[i] = lv_subject_get_id(subject);
+            return subject;
         }
     }
     TEST_FAIL_MESSAGE("subject pool exhausted");
@@ -29,16 +33,20 @@ static lv_subject_t * subject_create(lv_subject_type_t type)
 static void subject_forget(lv_subject_t * subject)
 {
     for(size_t i = 0; i < LV_ARRAYLEN(subjects); ++i) {
-        if(subjects[i] == subject) subjects[i] = NULL;
+        if(!lv_subject_id_valid(subjects[i])) continue;
+
+        /* Resolve rather than dereference `subject`: this is called both before a delete
+         * and after one, and after one the pointer is already dangling. An id that no
+         * longer resolves names something that has gone, whichever way it went. */
+        lv_subject_t * live = lv_subject_get(subjects[i]);
+        if(live == NULL || live == subject) subjects[i] = LV_SUBJECT_ID_NONE;
     }
 }
 
 /* Delete a registered Subject early, so tearDown() doesn't delete it twice. */
 static void subject_delete(lv_subject_t * subject)
 {
-    for(size_t i = 0; i < LV_ARRAYLEN(subjects); ++i) {
-        if(subjects[i] == subject) subjects[i] = NULL;
-    }
+    subject_forget(subject);
     lv_subject_delete(subject);
 }
 
@@ -60,18 +68,27 @@ void tearDown(void)
     while(progress) {
         progress = false;
         for(size_t i = 0; i < LV_ARRAYLEN(subjects); ++i) {
-            if(subjects[i] == NULL) continue;
-            if(lv_ll_get_len(&subjects[i]->dependents) > 0) continue;
-            if(subjects[i]->static_ref_cnt > 0) continue;
-            lv_subject_delete(subjects[i]);
-            subjects[i] = NULL;
+            if(!lv_subject_id_valid(subjects[i])) continue;
+
+            /* Already gone: the test deleted it, or a cascade took it. The id says so,
+             * which is the whole point of holding one. */
+            lv_subject_t * subject = lv_subject_get(subjects[i]);
+            if(subject == NULL) {
+                subjects[i] = LV_SUBJECT_ID_NONE;
+                progress = true;
+                continue;
+            }
+
+            if(lv_ll_get_len(&subject->dependents) > 0) continue;
+            lv_subject_delete(subject);
+            subjects[i] = LV_SUBJECT_ID_NONE;
             progress = true;
         }
     }
 
     /* Anything left would mean a dependency cycle, which must not be possible. */
     for(size_t i = 0; i < LV_ARRAYLEN(subjects); ++i) {
-        TEST_ASSERT_NULL(subjects[i]);
+        TEST_ASSERT_FALSE(lv_subject_id_valid(subjects[i]));
     }
 }
 
@@ -5174,14 +5191,22 @@ static lv_subject_t * branch_use_metric;
 static lv_subject_t * branch_celsius;
 static lv_subject_t * branch_fahrenheit;
 
-/* Reads one of two Subjects, so the other leaves no dependency edge behind. */
+static lv_subject_id_t branch_metric_id;
+static lv_subject_id_t branch_celsius_id;
+static lv_subject_id_t branch_fahrenheit_id;
+
+/* Reads one of two Subjects, so the other leaves no dependency edge behind.
+ *
+ * By id, because that is what makes reading a deleted Subject something the library can
+ * see. The same mapper written against pointers would follow one into freed memory. */
 static bool branch_shown_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
 {
     LV_UNUSED(subject);
     LV_UNUSED(user_data);
     int32_t before = *value;
-    *value = lv_subject_get_int(branch_use_metric) ? lv_subject_get_int(branch_celsius)
-             : lv_subject_get_int(branch_fahrenheit);
+    *value = lv_subject_indirect_get_int(branch_metric_id)
+             ? lv_subject_indirect_get_int(branch_celsius_id)
+             : lv_subject_indirect_get_int(branch_fahrenheit_id);
     return *value != before;
 }
 
@@ -5193,6 +5218,9 @@ static lv_subject_t * branch_build(void)
     lv_subject_set_int(branch_use_metric, 1);
     lv_subject_set_int(branch_celsius, 20);
     lv_subject_set_int(branch_fahrenheit, 68);
+    branch_metric_id = lv_subject_get_id(branch_use_metric);
+    branch_celsius_id = lv_subject_get_id(branch_celsius);
+    branch_fahrenheit_id = lv_subject_get_id(branch_fahrenheit);
 
     lv_subject_t * shown = subject_create(LV_SUBJECT_TYPE_INT);
     lv_subject_set_int_mapper(shown, branch_shown_mapper, NULL);
@@ -5211,55 +5239,317 @@ void test_subject_unread_branch_has_no_dynamic_edge(void)
     TEST_ASSERT_EQUAL(0, lv_ll_get_len(&branch_fahrenheit->dependents));
 }
 
-/* Declaring the branches keeps the unread one alive. */
-void test_subject_static_deps_refuse_deleting_an_unread_branch(void)
+static lv_subject_id_t doubled_src;
+
+/* Reads `shown`, so it inherits whatever state `shown` is in. */
+static bool doubled_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    int32_t before = *value;
+    *value = lv_subject_indirect_get_int(doubled_src) * 2;
+    return *value != before;
+}
+
+/* Deleting the branch nothing currently reads is allowed. Nothing depends on it at this
+ * moment, and no declaration claims otherwise, so the library has nothing to object to. */
+void test_subject_unread_branch_can_be_deleted(void)
 {
     lv_subject_t * shown = branch_build();
-    /* Filled here because the Subjects are created per test. Real code emits a
-     * `static lv_subject_t * const [] = {...}` initialiser instead. */
-    static lv_subject_t * shown_deps[3];
-    shown_deps[0] = branch_use_metric;
-    shown_deps[1] = branch_celsius;
-    shown_deps[2] = branch_fahrenheit;
-    lv_subject_set_static_deps(shown, shown_deps, 3);
-
     TEST_ASSERT_EQUAL(20, lv_subject_get_int(shown));
     TEST_ASSERT_EQUAL(0, lv_ll_get_len(&branch_fahrenheit->dependents));
 
-    /* Refused, even though nothing currently reads it. */
-    lv_subject_delete(branch_fahrenheit);
+    TEST_ASSERT_EQUAL(LV_RESULT_OK, lv_subject_delete(branch_fahrenheit));
+    branch_fahrenheit = NULL;
 
-    /* So taking the other branch still finds it there. */
+    /* The branch still taken is unaffected. */
+    lv_subject_set_int(branch_celsius, 21);
+    TEST_ASSERT_EQUAL(21, lv_subject_get_int(shown));
+    TEST_ASSERT_FALSE(lv_subject_has_error(lv_subject_get_id(shown)));
+}
+
+/* ...and taking that branch afterwards is what surfaces the problem. The Subject keeps
+ * the last value it computed properly rather than inventing one. */
+void test_subject_reading_a_deleted_branch_errors_the_reader(void)
+{
+    lv_subject_t * shown = branch_build();
+    lv_subject_id_t shown_id = lv_subject_get_id(shown);
+    TEST_ASSERT_EQUAL(20, lv_subject_get_int(shown));
+
+    lv_subject_delete(branch_fahrenheit);
+    branch_fahrenheit = NULL;
+
+    lv_subject_set_int(branch_use_metric, 0);   /* now it wants fahrenheit */
+
+    TEST_ASSERT_TRUE(lv_subject_has_error(shown_id));
+    /* The missing read gave zero and that is what was published. `errored` is the signal;
+     * holding the old value back as well would only freeze the half that still works. */
+    TEST_ASSERT_EQUAL(0, lv_subject_get_int(shown));
+}
+
+/* The error is a property of the last evaluation, not a latch, so a Subject heals by
+ * itself once the branch that needed the missing one is no longer taken. */
+void test_subject_error_clears_when_the_branch_changes(void)
+{
+    lv_subject_t * shown = branch_build();
+    lv_subject_id_t shown_id = lv_subject_get_id(shown);
+    TEST_ASSERT_EQUAL(20, lv_subject_get_int(shown));
+
+    lv_subject_delete(branch_fahrenheit);
+    branch_fahrenheit = NULL;
+
     lv_subject_set_int(branch_use_metric, 0);
+    TEST_ASSERT_TRUE(lv_subject_has_error(shown_id));
+
+    /* Back to the branch that is still there. Nobody intervened. */
+    lv_subject_set_int(branch_use_metric, 1);
+    lv_subject_set_int(branch_celsius, 25);
+    TEST_ASSERT_FALSE(lv_subject_has_error(shown_id));
+    TEST_ASSERT_EQUAL(25, lv_subject_get_int(shown));
+}
+
+/* An error reaches the Subjects that actually read the errored one, and no further. */
+void test_subject_error_propagates_to_readers(void)
+{
+    lv_subject_t * shown = branch_build();
+    lv_subject_id_t shown_id = lv_subject_get_id(shown);
+
+    doubled_src = shown_id;
+    lv_subject_t * doubled = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(doubled, doubled_mapper, NULL);
+    TEST_ASSERT_EQUAL(40, lv_subject_get_int(doubled));
+
+    lv_subject_delete(branch_fahrenheit);
+    branch_fahrenheit = NULL;
+    lv_subject_set_int(branch_use_metric, 0);
+
+    TEST_ASSERT_TRUE(lv_subject_has_error(shown_id));
+    TEST_ASSERT_TRUE(lv_subject_has_error(lv_subject_get_id(doubled)));
+    TEST_ASSERT_EQUAL(0, lv_subject_get_int(doubled));
+
+    lv_subject_set_int(branch_use_metric, 1);
+    TEST_ASSERT_FALSE(lv_subject_has_error(lv_subject_get_id(doubled)));
+}
+
+/* The id is checked, not merely dereferenced: one kept past a deletion does not come
+ * back to life when the slot is handed to something else. */
+void test_subject_id_does_not_resolve_after_the_slot_is_reused(void)
+{
+    lv_subject_t * gone = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(gone, 7);
+    lv_subject_id_t stale = lv_subject_get_id(gone);
+    TEST_ASSERT_NOT_NULL(lv_subject_get(stale));
+
+    lv_subject_delete(gone);
+    TEST_ASSERT_NULL(lv_subject_get(stale));
+
+    /* The next Subject very likely takes the slot that was just freed. */
+    lv_subject_t * fresh = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(fresh, 9);
+    TEST_ASSERT_NULL(lv_subject_get(stale));
+    TEST_ASSERT_FALSE(lv_subject_id_eq(stale, lv_subject_get_id(fresh)));
+    lv_subject_delete(fresh);
+}
+
+/* A write that cannot reach its Subject fails the whole transaction. Keeping the writes
+ * that did land would be exactly the half-applied change a transaction exists to stop. */
+void test_subject_write_to_a_missing_subject_fails_the_transaction(void)
+{
+    lv_subject_t * kept = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_t * doomed = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(kept, 1);
+    lv_subject_set_int(doomed, 2);
+    lv_subject_id_t gone_id = lv_subject_get_id(doomed);
+    lv_subject_delete(doomed);
+
+    lv_subject_transaction_begin();
+    lv_subject_set_int(kept, 99);                    /* this one lands */
+    lv_subject_indirect_set_int(gone_id, 5);         /* this one cannot */
+    TEST_ASSERT_EQUAL(LV_RESULT_INVALID, lv_subject_transaction_commit());
+
+    /* The write that did land went back with it. */
+    TEST_ASSERT_EQUAL(1, lv_subject_get_int(kept));
+}
+
+/* The same rule reaches a setter: it may return true while one of its own writes went
+ * nowhere, and that still fails the transaction. */
+static lv_subject_id_t half_target_a, half_target_b;
+
+static bool half_setter(lv_subject_t * subject, void * user_data, int32_t value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    lv_subject_indirect_set_int(half_target_a, value);
+    lv_subject_indirect_set_int(half_target_b, value);   /* b may be gone */
+    return true;
+}
+
+static bool half_mapper(lv_subject_t * subject, void * user_data, int32_t * value)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    int32_t before = *value;
+    *value = lv_subject_indirect_get_int(half_target_a);
+    return *value != before;
+}
+
+void test_subject_setter_writing_a_missing_subject_rolls_back(void)
+{
+    lv_subject_t * a = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_t * b = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int(a, 1);
+    lv_subject_set_int(b, 1);
+    half_target_a = lv_subject_get_id(a);
+    half_target_b = lv_subject_get_id(b);
+
+    lv_subject_t * both = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_set_int_mapper(both, half_mapper, NULL);
+    lv_subject_set_int_setter(both, half_setter, NULL);
+    TEST_ASSERT_EQUAL(1, lv_subject_get_int(both));
+
+    /* With both alive the write goes through. */
+    lv_subject_set_int(both, 4);
+    TEST_ASSERT_EQUAL(4, lv_subject_get_int(a));
+    TEST_ASSERT_EQUAL(4, lv_subject_get_int(b));
+
+    /* Take one away. The setter still returns true, but half its work went nowhere. */
+    lv_subject_delete_forced(b);
+    lv_subject_set_int(both, 7);
+    TEST_ASSERT_EQUAL(4, lv_subject_get_int(a));   /* put back, not left at 7 */
+}
+
+/* An aggregator carries no value, so being errored must not stop it notifying: a binding
+ * that reads two Subjects has to keep following the one that is still there. */
+static lv_subject_id_t agg_a_id, agg_b_id;
+
+static bool agg_mapper(lv_subject_t * subject, void * user_data)
+{
+    LV_UNUSED(subject);
+    LV_UNUSED(user_data);
+    (void)lv_subject_indirect_get_int(agg_a_id);
+    (void)lv_subject_indirect_get_int(agg_b_id);
+    return true;
+}
+
+void test_subject_errored_aggregator_still_notifies(void)
+{
+    lv_subject_t * a = subject_create(LV_SUBJECT_TYPE_INT);
+    lv_subject_t * b = subject_create(LV_SUBJECT_TYPE_INT);
+    agg_a_id = lv_subject_get_id(a);
+    agg_b_id = lv_subject_get_id(b);
+
+    lv_subject_t * agg = subject_create(LV_SUBJECT_TYPE_NONE);
+    lv_subject_set_none_mapper(agg, agg_mapper, NULL);
+    lv_subject_add_observer(agg, observer_basic, NULL);
+    lv_subject_flush();
+    observer_called = 0;
+
+    /* Take one of the two away. The aggregator is errored from now on. */
+    lv_subject_delete_forced(b);
+    lv_subject_flush();
+    TEST_ASSERT_TRUE(lv_subject_has_error(lv_subject_get_id(agg)));
+
+    /* The one still there must keep getting through. */
+    uint32_t before = observer_called;
+    lv_subject_set_int(a, 7);
+    lv_subject_flush();
+    TEST_ASSERT_GREATER_THAN(before, observer_called);
+}
+
+/* A forced delete goes through even though something reads the Subject. The reader is
+ * not taken with it, as a cascade would; it errors out on its next evaluation instead. */
+void test_subject_delete_forced_errors_its_readers(void)
+{
+    lv_subject_t * shown = branch_build();
+    lv_subject_id_t shown_id = lv_subject_get_id(shown);
+    TEST_ASSERT_EQUAL(20, lv_subject_get_int(shown));
+
+    /* celsius is read right now, so the ordinary delete refuses it. */
+    TEST_ASSERT_EQUAL(LV_RESULT_INVALID, lv_subject_delete(branch_celsius));
+
+    TEST_ASSERT_EQUAL(LV_RESULT_OK, lv_subject_delete_forced(branch_celsius));
+    branch_celsius = NULL;
+
+    /* The reader survived, and says it cannot be trusted. */
+    TEST_ASSERT_NOT_NULL(lv_subject_get(shown_id));
+    TEST_ASSERT_TRUE(lv_subject_has_error(shown_id));
+    TEST_ASSERT_EQUAL(0, lv_subject_get_int(shown));
+
+    /* And it recovers by taking the branch that is still there. */
+    lv_subject_set_int(branch_use_metric, 0);
+    TEST_ASSERT_FALSE(lv_subject_has_error(shown_id));
     TEST_ASSERT_EQUAL(68, lv_subject_get_int(shown));
 }
 
-/* Clearing the declaration gives the references back. */
-void test_subject_static_deps_can_be_cleared(void)
+/* A Subject can be given the slot it is meant to occupy, so generated code can write its
+ * id down as a constant instead of reading a variable to find it. */
+void test_subject_create_with_id_takes_the_slot_asked_for(void)
 {
-    lv_subject_t * shown = branch_build();
-    static lv_subject_t * deps[1];
-    deps[0] = branch_fahrenheit;
+    lv_subject_id_t want = lv_subject_id_make(40, 1);
+    lv_subject_t * s = lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, want);
+    TEST_ASSERT_NOT_NULL(s);
+    subject_forget(NULL);          /* sweep, then register this one by hand */
+    TEST_ASSERT_TRUE(lv_subject_id_eq(want, lv_subject_get_id(s)));
+    TEST_ASSERT_EQUAL_PTR(s, lv_subject_get(want));
 
-    lv_subject_set_static_deps(shown, deps, 1);
-    TEST_ASSERT_EQUAL(1, branch_fahrenheit->static_ref_cnt);
-
-    lv_subject_set_static_deps(shown, NULL, 0);
-    TEST_ASSERT_EQUAL(0, branch_fahrenheit->static_ref_cnt);
+    lv_subject_set_int(s, 5);
+    TEST_ASSERT_EQUAL(5, lv_subject_indirect_get_int(want));
+    lv_subject_delete(s);
 }
 
-/* A setter's write targets are declared the same way: they have to outlive the Subject
- * that writes them just as a mapper's sources do. */
-void test_subject_static_deps_cover_setter_targets(void)
+/* Two Subjects cannot share a fixed id. */
+void test_subject_create_with_id_refuses_an_occupied_slot(void)
 {
-    chain_build();
-    static lv_subject_t * k_deps[1];
-    k_deps[0] = chain_adc;
-    lv_subject_set_static_deps(chain_k, k_deps, 1);
+    lv_subject_id_t want = lv_subject_id_make(41, 1);
+    lv_subject_t * first = lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, want);
+    TEST_ASSERT_NOT_NULL(first);
 
-    lv_subject_delete(chain_adc);           /* refused: k's setter writes it */
-    lv_subject_set_int(chain_k, 350);
-    TEST_ASSERT_EQUAL(250, lv_subject_get_int(chain_adc));
+    TEST_ASSERT_NULL(lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, want));
+    lv_subject_delete(first);
+}
+
+/* Once a Subject has been deleted from a slot the generation has moved on, so the id the
+ * constant was written for is used up and cannot be handed out again. */
+void test_subject_create_with_id_refuses_a_used_up_generation(void)
+{
+    lv_subject_id_t want = lv_subject_id_make(42, 1);
+    lv_subject_t * first = lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, want);
+    TEST_ASSERT_NOT_NULL(first);
+    lv_subject_delete(first);
+
+    /* Generation 1 is spent. */
+    TEST_ASSERT_NULL(lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, want));
+
+    /* The slot itself is still usable, on the generation it has actually reached. */
+    lv_subject_t * second = lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, lv_subject_id_make(42, 2));
+    TEST_ASSERT_NOT_NULL(second);
+    lv_subject_delete(second);
+}
+
+/* Slot 0 is reserved so that a zeroed id is always the invalid one. */
+void test_subject_create_with_id_refuses_slot_zero(void)
+{
+    TEST_ASSERT_NULL(lv_subject_create_with_id(LV_SUBJECT_TYPE_INT, lv_subject_id_make(0, 1)));
+}
+
+/* The cost of allowing a delete that is legal now is finding out later, so there is a
+ * way to ask which Subjects are in that state. */
+void test_subject_report_errors_finds_them(void)
+{
+    lv_subject_t * shown = branch_build();
+    TEST_ASSERT_EQUAL(20, lv_subject_get_int(shown));
+    TEST_ASSERT_EQUAL(0, lv_subject_report_errors());
+
+    lv_subject_delete(branch_fahrenheit);
+    branch_fahrenheit = NULL;
+    lv_subject_set_int(branch_use_metric, 0);
+
+    /* `shown` is lazy, so it has not run since the deletion and has not failed yet.
+     * Reading it is what makes the failure happen, and only then is there anything to
+     * report. */
+    TEST_ASSERT_EQUAL(0, lv_subject_report_errors());
+    (void)lv_subject_get_int(shown);
+    TEST_ASSERT_EQUAL(1, lv_subject_report_errors());
 }
 
 /*---------------------------------------------------------------

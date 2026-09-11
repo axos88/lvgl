@@ -124,6 +124,12 @@ typedef struct _lv_global_t {
 
 #if LV_USE_OBSERVER
     lv_ll_t subject_ll;
+    void * subject_slots;                   /**< Registry: slot table that turns an
+                                             *   lv_subject_id_t into a Subject, or into NULL
+                                             *   once it is deleted. Really a subject_slot_t *. */
+    uint32_t subject_slot_cnt;              /**< Slots in use, including slot 0, which is
+                                             *   reserved so that id 0 is never valid. */
+    uint32_t subject_slot_cap;              /**< Slots allocated */
     lv_subject_t * subject_evaluating;      /**< Subject whose mapper is running, for dependency autowiring */
     lv_timer_t * subject_flush_timer;       /**< Evaluates dirty lazy Subjects once per lv_timer_handler() pass */
     uint32_t subject_flushing : 4;          /**< Depth of the notification phase. An Observer
@@ -139,6 +145,13 @@ typedef struct _lv_global_t {
     uint32_t subject_txn_aborting : 1;      /**< A setter failed, so the writes are being undone */
     uint32_t subject_txn_aborted : 1;       /**< The last transaction was rolled back, for
                                              *   lv_subject_transaction_commit() to report */
+    uint32_t subject_txn_failed : 1;        /**< A write in this transaction could not reach
+                                             *   its Subject, so the transaction must roll
+                                             *   back rather than commit a partial change */
+    uint32_t subject_eval_failed : 1;       /**< The evaluation now running read a Subject that
+                                             *   is gone, or one that is itself errored. Cleared
+                                             *   before every evaluation, so it describes only
+                                             *   the one in progress. */
 #endif
 
 #if defined(LV_DRAW_SW_SHADOW_CACHE_SIZE) && LV_DRAW_SW_SHADOW_CACHE_SIZE > 0

@@ -50,6 +50,55 @@ typedef enum {
 } lv_subject_type_t;
 
 /**
+ * A Subject's entry in the registry.
+ *
+ * A pointer to a Subject stops being safe the moment the Subject is deleted, and nothing
+ * about the pointer says so. An id is checked on every use instead: it carries the slot
+ * the Subject lives in and the generation of that slot, so an id for a Subject that is
+ * gone resolves to NULL, and an id kept past a slot's reuse does not resolve to whatever
+ * took its place.
+ *
+ * `LV_SUBJECT_ID_NONE` is never valid. Slot 0 is reserved so that a zeroed id is always
+ * the invalid one.
+ */
+typedef struct {
+    uint16_t slot;   /**< Where in the registry the Subject lives. 0 is never valid. */
+    uint16_t gen;    /**< Which occupant of that slot this id refers to */
+} lv_subject_id_t;
+
+/** An id that refers to nothing. */
+static inline lv_subject_id_t lv_subject_id_none(void)
+{
+    lv_subject_id_t id = {0, 0};
+    return id;
+}
+#define LV_SUBJECT_ID_NONE lv_subject_id_none()
+
+/** Does this id refer to anything at all? Says nothing about whether it still resolves. */
+static inline bool lv_subject_id_valid(lv_subject_id_t id)
+{
+    return id.slot != 0;
+}
+
+/**
+ * Build an id from its parts.
+ *
+ * Generated code uses this to write a Subject's id down as a constant, so an expression
+ * can refer to the Subject without reading a variable first.
+ */
+static inline lv_subject_id_t lv_subject_id_make(uint16_t slot, uint16_t gen)
+{
+    lv_subject_id_t id = {slot, gen};
+    return id;
+}
+
+/** Do two ids refer to the same occupant of the same slot? */
+static inline bool lv_subject_id_eq(lv_subject_id_t a, lv_subject_id_t b)
+{
+    return a.slot == b.slot && a.gen == b.gen;
+}
+
+/**
  * How a Subject converts between `int32_t` and `float`.
  *
  * An `int` read as a `float` is exact and needs no policy. The other direction has to
@@ -363,13 +412,8 @@ struct _lv_subject_t {
      * holds only what the last evaluation actually read, so a Subject on a branch that
      * was not taken looks unreferenced and could be deleted out from under a later
      * evaluation. These edges cover every branch instead, and they do not change. */
-    lv_subject_t * const * static_deps;   /**< Every Subject the mapper or setter could touch.
-                                           * Caller-owned, so it has to outlive the Subject.
-                                           * @nullable */
-    uint32_t static_dep_cnt;             /**< Entries in `static_deps` */
-    uint32_t static_ref_cnt;             /**< How many Subjects name this one in their
-                                          * `static_deps`. Deleting is refused while it is
-                                          * above zero. */
+    lv_subject_id_t id;                  /**< This Subject's own entry in the registry, so it
+                                          * can free the slot when it goes. */
     uint16_t immediate_observer_cnt;     /**< Observers with LV_OBSERVER_MODE_IMMEDIATE */
     uint32_t version;                    /**< Bumped on every actual value change. A dependent
                                           * compares it against the version it last read to
@@ -408,6 +452,16 @@ struct _lv_subject_t {
                                           * with the Subject. */
     uint32_t owns_value           :  1;  /**< The Subject owns the data its stored pointer
                                           * value refers to. */
+    uint32_t force_eval           :  1;  /**< A Subject this one read has been deleted, so the
+                                          * next evaluation must really run: the dependencies
+                                          * left behind may all be unchanged, and skipping on
+                                          * that basis would never notice the loss. */
+    uint32_t errored              :  1;  /**< The last evaluation read a Subject that is gone,
+                                          * so the value below it is not trustworthy and was
+                                          * left as it was. Recomputed on every evaluation
+                                          * rather than latched, so a Subject heals by itself
+                                          * once the branch that needed the missing one is no
+                                          * longer taken. */
 };
 
 /**
@@ -596,6 +650,23 @@ lv_result_t lv_subject_delete(lv_subject_t * subject);
  *                  is deleted too. Pointers to them become invalid.
  */
 void lv_subject_delete_cascade(lv_subject_t * subject);
+/**
+ * Delete a Subject even though other Subjects read it.
+ *
+ * @ref lv_subject_delete refuses while anything depends on the target, and
+ * @ref lv_subject_delete_cascade takes the dependents with it. This does neither: the
+ * Subject goes and its readers stay, so the next time one of them evaluates and reaches
+ * for this Subject the read fails and that reader is marked errored. It keeps the value
+ * it last computed properly, and recovers by itself if it stops reading the missing one.
+ *
+ * Safe only for a reader that reaches this Subject by id. One that kept a resolved
+ * pointer will follow it into freed memory, exactly as it always would.
+ *
+ * @param subject   pointer to a Subject
+ * @return          LV_RESULT_OK, or LV_RESULT_INVALID if there was nothing to delete
+ */
+lv_result_t lv_subject_delete_forced(lv_subject_t * subject);
+
 
 /**
  * Register a callback to run just before a Subject is destroyed.
@@ -1111,8 +1182,14 @@ void lv_subject_transaction_begin(void);
  * no other way to find out, because a rolled back transaction changes nothing and so
  * notifies nobody. Always pair a begin with a commit and read the result.
  *
+ * A write that cannot reach its Subject — one deleted while the transaction was open, or
+ * named by an id that no longer resolves — fails the transaction too. The rollback happens
+ * here rather than at the write, so the rest of the caller's writes still run and
+ * everything goes back together.
+ *
  * @return  LV_RESULT_OK      the transaction committed.
- *          LV_RESULT_INVALID it had already been rolled back, or no transaction was
+ *          LV_RESULT_INVALID it was rolled back — by a setter that refused, or by a write
+ *                            that could not reach its Subject — or no transaction was
  *                            open. Either way nothing was committed.
  */
 lv_result_t lv_subject_transaction_commit(void);
@@ -1136,6 +1213,97 @@ lv_result_t lv_subject_transaction_commit(void);
  *          `(int32_t)(a - b) < 0`, never with `a < b`.
  */
 uint32_t lv_subject_get_changed_at(lv_subject_t * subject);
+
+/**
+ * Resolve a registry id to a Subject.
+ * @param id    an id from @ref lv_subject_get_id
+ * @return      the Subject, or NULL if it has been deleted. Never a stale pointer: an id
+ *              carries the generation of its slot, so it stops resolving when the Subject
+ *              goes and does not come back when the slot is reused.
+ */
+lv_subject_t * lv_subject_get(lv_subject_id_t id);
+/**
+ * Create a Subject in a chosen registry slot.
+ *
+ * The point is a *stable* id: generated code assigns each Subject a fixed slot, so its id
+ * is known when the code is written and an expression can carry it as a constant rather
+ * than reading a variable. That only holds if the slot really is the one asked for, so
+ * this refuses instead of moving the Subject somewhere else.
+ *
+ * @param type  the Subject's value type
+ * @param id    the slot and generation to take
+ * @return      the Subject, or NULL if the slot already holds one, the slot is retired,
+ *              or the slot has moved past the generation asked for — which is what
+ *              happens once a Subject has been deleted from it.
+ */
+lv_subject_t * lv_subject_create_with_id(lv_subject_type_t type, lv_subject_id_t id);
+
+
+/**
+ * The registry id of a Subject.
+ *
+ * Hold this rather than the pointer anywhere the Subject may outlive the reference. A
+ * pointer says nothing about whether it is still valid; an id is checked on every use.
+ * @param subject   pointer to a Subject
+ * @return          its id, or LV_SUBJECT_ID_NONE
+ */
+lv_subject_id_t lv_subject_get_id(const lv_subject_t * subject);
+
+/**
+ * Is this Subject untrustworthy?
+ *
+ * True when the Subject is gone, or when its last evaluation read one that was.
+ *
+ * An errored Subject still publishes what it computed — a read of a missing Subject gives
+ * zero, so the value is defined rather than leftover. This flag is the signal that it is
+ * not to be trusted; the value keeps moving so that whatever the Subject reads that is
+ * still there goes on working.
+ * @param id    a registry id
+ * @return      true if the value should not be relied on
+ */
+bool lv_subject_has_error(lv_subject_id_t id);
+
+/**
+ * Report every Subject whose last evaluation failed.
+ *
+ * A deletion is allowed whenever nothing reads the Subject *at that moment*, so a mapper
+ * that would read it on a branch not currently taken is not consulted. The cost is that
+ * the problem shows up later, when the branch is finally taken. This walks the whole
+ * registry and writes each errored Subject to the log, which is how that is found
+ * without waiting for someone to notice on screen.
+ *
+ * @note    It reports what each Subject's *last evaluation* found, and does not start
+ *          one. A lazy Subject that nothing has read since the deletion has not failed
+ *          yet — it is merely stale — so it is not listed. Read the Subjects of interest,
+ *          or call @ref lv_subject_flush, before relying on the count.
+ * @return      how many errored Subjects were found
+ */
+uint32_t lv_subject_report_errors(void);
+
+/**
+ * Indirect accessors: they take a registry id rather than a pointer.
+ *
+ * Each resolves the id itself. A read of a Subject that is gone, or of one that is
+ * itself errored, returns a zero value and marks the evaluation that made it; when that
+ * evaluation finishes, its Subject is marked errored and keeps the value it had. A
+ * Subject therefore works exactly while the dependencies it actually reads are alive,
+ * and recovers by itself when a branch stops needing a missing one.
+ */
+int32_t lv_subject_indirect_get_int(lv_subject_id_t id);
+void lv_subject_indirect_set_int(lv_subject_id_t id, int32_t value);
+#if LV_USE_FLOAT
+float lv_subject_indirect_get_float(lv_subject_id_t id);
+void lv_subject_indirect_set_float(lv_subject_id_t id, float value);
+#endif
+lv_color_t lv_subject_indirect_get_color(lv_subject_id_t id);
+void lv_subject_indirect_set_color(lv_subject_id_t id, lv_color_t value);
+const char * lv_subject_indirect_get_string(lv_subject_id_t id);
+void lv_subject_indirect_set_string(lv_subject_id_t id, const char * value);
+const void * lv_subject_indirect_get_pointer(lv_subject_id_t id);
+void lv_subject_indirect_set_pointer(lv_subject_id_t id, void * value);
+uint32_t lv_subject_indirect_get_changed_at(lv_subject_id_t id);
+
+
 
 /**
  * Id of the transaction in progress, or of the last one if none is open.
@@ -1339,41 +1507,6 @@ void lv_subject_set_string_setter(lv_subject_t * subject, lv_subject_string_sett
  */
 bool lv_subject_is_writable(const lv_subject_t * subject);
 
-/**
- * Declare every Subject this one's mapper or setter could touch, on any branch.
- *
- * The dependency edges LVGL wires up on its own are the ones a mapper *actually* read
- * last time it ran, which is what makes a branch that was not taken not fire. They are
- * the wrong thing to base lifetime on: with
- *
- * ```c
- * shown = use_metric ? celsius : fahrenheit
- * ```
- *
- * and `use_metric` true, nothing refers to `fahrenheit`, so deleting it succeeds — and
- * flipping `use_metric` then reads freed memory.
- *
- * This declares the edges that do not change. A Subject named here cannot be deleted
- * while this Subject is alive. Include the Subjects a setter *writes* as well as the ones
- * a mapper reads: a setter's targets have to outlive it just the same.
- *
- * The XML exporter emits this, because it can see every branch of an expression. A
- * hand-written mapper has to call it, or the Subjects it reads stay deletable.
- *
- * ```c
- * static lv_subject_t * const shown_deps[] = { &use_metric, &celsius, &fahrenheit };
- * lv_subject_set_static_deps(&shown, shown_deps, 3);
- * ```
- *
- * @param subject   pointer to a Subject
- * @param deps      array of Subjects, **not copied**, so it must outlive `subject`.
- *                  NULL clears the declaration.
- * @param count     entries in `deps`
- *
- * @note With `LV_USE_ASSERT_OBSERVER`, reading a Subject that is not in the list is
- *       caught while the mapper runs. That is the same bug arriving by another route.
- */
-void lv_subject_set_static_deps(lv_subject_t * subject, lv_subject_t * const * deps, uint32_t count);
 
 /**
  * Change the bounds of a Subject made with @ref lv_subject_create_clamped.

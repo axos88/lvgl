@@ -452,10 +452,13 @@ struct _lv_subject_t {
                                           * with the Subject. */
     uint32_t owns_value           :  1;  /**< The Subject owns the data its stored pointer
                                           * value refers to. */
-    uint32_t force_eval           :  1;  /**< A Subject this one read has been deleted, so the
-                                          * next evaluation must really run: the dependencies
-                                          * left behind may all be unchanged, and skipping on
-                                          * that basis would never notice the loss. */
+    uint32_t force_eval           :  1;  /**< The next evaluation must really run, whatever
+                                          * the dependencies look like. Set when a Subject
+                                          * this one read has been deleted, and when the
+                                          * mapper itself has been replaced: in both cases
+                                          * what was recorded describes something that is
+                                          * no longer there, so skipping on the basis of
+                                          * "nothing changed" would never notice. */
     uint32_t errored              :  1;  /**< The last evaluation read a Subject that is gone,
                                           * so the value below it is not trustworthy and was
                                           * left as it was. Recomputed on every evaluation

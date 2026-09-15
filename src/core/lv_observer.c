@@ -607,6 +607,10 @@ void lv_subject_set_int_mapper(lv_subject_t * subject, lv_subject_int_mapper_t m
     subject->mapper.int_cb = mapper;
     subject->mapper_user_data = user_data;
     subject->has_mapper = mapper != NULL;
+    /* The recorded dependencies describe the mapper that has just been replaced. They
+     * may all be unchanged, and skipping on that basis would leave the Subject holding
+     * the old mapper's answer and the old mapper's edges. */
+    subject->force_eval = 1;
     if(mapper) subject_recompute(subject);
 }
 
@@ -681,6 +685,10 @@ void lv_subject_set_float_mapper(lv_subject_t * subject, lv_subject_float_mapper
     subject->mapper.float_cb = mapper;
     subject->mapper_user_data = user_data;
     subject->has_mapper = mapper != NULL;
+    /* The recorded dependencies describe the mapper that has just been replaced. They
+     * may all be unchanged, and skipping on that basis would leave the Subject holding
+     * the old mapper's answer and the old mapper's edges. */
+    subject->force_eval = 1;
     if(mapper) subject_recompute(subject);
 }
 #endif
@@ -691,6 +699,10 @@ void lv_subject_set_pointer_mapper(lv_subject_t * subject, lv_subject_pointer_ma
     subject->mapper.pointer_cb = mapper;
     subject->mapper_user_data = user_data;
     subject->has_mapper = mapper != NULL;
+    /* The recorded dependencies describe the mapper that has just been replaced. They
+     * may all be unchanged, and skipping on that basis would leave the Subject holding
+     * the old mapper's answer and the old mapper's edges. */
+    subject->force_eval = 1;
     if(mapper) subject_recompute(subject);
 }
 
@@ -700,6 +712,10 @@ void lv_subject_set_color_mapper(lv_subject_t * subject, lv_subject_color_mapper
     subject->mapper.color_cb = mapper;
     subject->mapper_user_data = user_data;
     subject->has_mapper = mapper != NULL;
+    /* The recorded dependencies describe the mapper that has just been replaced. They
+     * may all be unchanged, and skipping on that basis would leave the Subject holding
+     * the old mapper's answer and the old mapper's edges. */
+    subject->force_eval = 1;
     if(mapper) subject_recompute(subject);
 }
 
@@ -713,6 +729,10 @@ void lv_subject_set_string_mapper(lv_subject_t * subject, lv_subject_string_mapp
     subject->mapper.string_cb = mapper;
     subject->mapper_user_data = user_data;
     subject->has_mapper = mapper != NULL;
+    /* The recorded dependencies describe the mapper that has just been replaced. They
+     * may all be unchanged, and skipping on that basis would leave the Subject holding
+     * the old mapper's answer and the old mapper's edges. */
+    subject->force_eval = 1;
     if(mapper) subject_recompute(subject);
 }
 
@@ -726,6 +746,10 @@ void lv_subject_set_none_mapper(lv_subject_t * subject, lv_subject_none_mapper_t
     subject->mapper.none_cb = mapper;
     subject->mapper_user_data = user_data;
     subject->has_mapper = mapper != NULL;
+    /* The recorded dependencies describe the mapper that has just been replaced. They
+     * may all be unchanged, and skipping on that basis would leave the Subject holding
+     * the old mapper's answer and the old mapper's edges. */
+    subject->force_eval = 1;
     if(mapper) subject_recompute(subject);
 }
 
